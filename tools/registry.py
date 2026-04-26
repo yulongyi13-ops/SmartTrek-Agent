@@ -1,0 +1,34 @@
+"""工具工厂注册表：支持按名称为子 Agent 分配权限。"""
+
+from __future__ import annotations
+
+from typing import Callable, Dict
+
+from config.settings import Settings
+from core.artifact_manager import ArtifactManager
+from core.planner import PlanningManager
+from tools.amap_tools import POISearchTool, WeatherTool
+from tools.base_tool import BaseTool
+from tools.plan_tool import UpdatePlanTool
+from tools.skill_tool import LoadSkillTool
+from tools.write_report_tool import WriteReportTool
+from skills.registry import SkillRegistry
+
+ToolFactory = Callable[[], BaseTool]
+
+
+def build_tool_factories(
+    settings: Settings,
+    planner: PlanningManager,
+    turn_getter: Callable[[], int],
+    skill_registry: SkillRegistry,
+    artifact_manager: ArtifactManager,
+) -> Dict[str, ToolFactory]:
+    """构建可复用的工具工厂映射。"""
+    return {
+        "weather": lambda: WeatherTool(amap_api_key=settings.amap_api_key),
+        "poi": lambda: POISearchTool(amap_api_key=settings.amap_api_key),
+        "plan": lambda: UpdatePlanTool(planner=planner, turn_getter=turn_getter),
+        "skill": lambda: LoadSkillTool(skill_registry=skill_registry),
+        "write_report": lambda: WriteReportTool(artifact_manager=artifact_manager),
+    }

@@ -1,0 +1,22 @@
+# 环境变量配置（绝不能上传 API Keys！）
+.env
+
+# Python 缓存和虚拟环境
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# 运行生成的临时文件或日志
+workspace/artifacts/
+*.log
+
+# IDE 配置文件 (可选)
+.idea/
+.vscode/
+.DS_Store
