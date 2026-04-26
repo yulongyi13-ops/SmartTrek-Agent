@@ -6,6 +6,7 @@ import copy
 from datetime import datetime
 from typing import Any, Callable, Dict, List
 
+from core.security import PermissionManager
 from tools.base_tool import BaseTool
 
 
@@ -14,8 +15,10 @@ class DelegateTaskTool(BaseTool):
 
     name = "delegate_task"
     description = (
-        "将专项子任务委派给临时子智能体并返回总结。"
-        "凡是多条件对比（如酒店筛选、候选方案排名）应优先使用本工具。"
+        "当且仅当你需要查询天气、搜索航班、查找酒店、搜索景点等具体外部信息时，"
+        "必须调用此工具委派子智能体去完成。你自身没有直接访问外部互联网或地图 API 的权限。"
+        "在委派时，请在 sub_task_description 中清晰描述你需要子智能体帮你查什么，"
+        "并在 required_tools 中传入子智能体需要的工具名称（如 ['weather', 'poi']）。"
     )
 
     def __init__(
@@ -34,8 +37,10 @@ class DelegateTaskTool(BaseTool):
             "function": {
                 "name": self.name,
                 "description": (
-                    "把明确子任务交给子智能体。"
-                    "当任务是酒店/景点多约束对比时，必须使用该工具。"
+                    "当且仅当你需要查询天气、搜索航班、查找酒店、搜索景点等具体外部信息时，"
+                    "必须调用此工具委派子智能体去完成。你自身没有直接访问外部互联网或地图 API 的权限。"
+                    "在委派时，请在 sub_task_description 中清晰描述你需要子智能体帮你查什么，"
+                    "并在 required_tools 中传入子智能体需要的工具名称（如 ['weather', 'poi']）。"
                 ),
                 "parameters": {
                     "type": "object",
@@ -64,7 +69,28 @@ class DelegateTaskTool(BaseTool):
         if not isinstance(required_tools, list) or not required_tools:
             return "委派失败：required_tools 必须是非空列表。"
 
-        invalid = [name for name in required_tools if name not in self.tool_factories]
+        normalized_tools = [
+            str(name).strip().lower().replace("-", "_")
+            for name in required_tools
+            if str(name).strip()
+        ]
+        alias_map = {
+            "hotel": "poi",
+            "hotels": "poi",
+            "scenic": "poi",
+            "sightseeing": "poi",
+            "route_planning": "route",
+            "routeplanning": "route",
+            "search": "web_search",
+            "websearch": "web_search",
+            "tavily": "web_search",
+        }
+        resolved_tools = [alias_map.get(name, name) for name in normalized_tools]
+
+        if not resolved_tools:
+            return "委派失败：required_tools 为空。"
+
+        invalid = [name for name in resolved_tools if name not in self.tool_factories]
         if invalid:
             return f"委派失败：存在未注册工具键名 {invalid}。"
 
@@ -73,7 +99,7 @@ class DelegateTaskTool(BaseTool):
 
             print("\033[95m[Parent Agent] 决定委派任务...\033[0m")
 
-            child_tools = [self.tool_factories[name]() for name in required_tools]
+            child_tools = [self.tool_factories[name]() for name in resolved_tools]
             parent_messages = self.parent_agent.get_messages_snapshot()
             context_tail = copy.deepcopy(parent_messages[-6:])
             planning_state = self.parent_agent.get_plan_overview()
@@ -87,13 +113,16 @@ class DelegateTaskTool(BaseTool):
             )
 
             child_agent = BaseAgent(
-                name=f"Child Agent - {required_tools[0]}",
+                name=f"Child Agent - {resolved_tools[0]}",
                 llm_client=self.parent_agent.llm_client,
                 tools=child_tools,
                 system_prompt=child_prompt,
                 max_iterations=self.child_max_iterations,
                 messages=context_tail,
                 force_final_summary=True,
+                permission_manager=PermissionManager(
+                    mode=self.parent_agent.permission_manager.mode
+                ),
             )
 
             print("\033[94m    [Child Agent - Task] 开始执行子任务...\033[0m")

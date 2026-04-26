@@ -6,10 +6,14 @@ from typing import Callable, Dict
 
 from config.settings import Settings
 from core.artifact_manager import ArtifactManager
+from core.budget_manager import BudgetManager
 from core.planner import PlanningManager
-from tools.amap_tools import POISearchTool, WeatherTool
+from tools.amap_tools import POISearchTool, RoutePlanningTool, WeatherTool
 from tools.base_tool import BaseTool
+from tools.budget_tool import RecordExpenseTool
+from tools.export_tool import ExportIcsTool
 from tools.plan_tool import UpdatePlanTool
+from tools.search_tool import WebSearchTool
 from tools.skill_tool import LoadSkillTool
 from tools.write_report_tool import WriteReportTool
 from skills.registry import SkillRegistry
@@ -23,12 +27,17 @@ def build_tool_factories(
     turn_getter: Callable[[], int],
     skill_registry: SkillRegistry,
     artifact_manager: ArtifactManager,
+    budget_manager: BudgetManager,
 ) -> Dict[str, ToolFactory]:
     """构建可复用的工具工厂映射。"""
     return {
         "weather": lambda: WeatherTool(amap_api_key=settings.amap_api_key),
         "poi": lambda: POISearchTool(amap_api_key=settings.amap_api_key),
+        "route": lambda: RoutePlanningTool(amap_api_key=settings.amap_api_key),
         "plan": lambda: UpdatePlanTool(planner=planner, turn_getter=turn_getter),
+        "budget": lambda: RecordExpenseTool(budget_manager=budget_manager),
         "skill": lambda: LoadSkillTool(skill_registry=skill_registry),
+        "web_search": lambda: WebSearchTool(tavily_api_key=settings.tavily_api_key),
         "write_report": lambda: WriteReportTool(artifact_manager=artifact_manager),
+        "export_ics": lambda: ExportIcsTool(),
     }

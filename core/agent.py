@@ -8,9 +8,11 @@ from typing import Any, Dict, List, Optional
 
 from config.settings import Settings
 from core.artifact_manager import ArtifactManager
+from core.budget_manager import BudgetManager
 from core.llm_client import LLMClient
 from core.memory_manager import MemoryManager
 from core.planner import PlanningManager
+from core.security import Mode, PermissionManager
 from skills.registry import SkillRegistry
 from prompts.system_prompts import TRAVEL_AGENT_SYSTEM_PROMPT
 from tools.base_tool import BaseTool
@@ -29,6 +31,7 @@ class BaseAgent:
         messages: Optional[List[Dict[str, Any]]] = None,
         force_final_summary: bool = False,
         memory_manager: Optional[MemoryManager] = None,
+        permission_manager: Optional[PermissionManager] = None,
     ) -> None:
         self.name = name
         self.llm_client = llm_client
@@ -39,6 +42,8 @@ class BaseAgent:
         self.force_final_summary = force_final_summary
         self.last_run_tool_names: List[str] = []
         self.memory_manager = memory_manager or MemoryManager()
+        self.permission_manager = permission_manager or PermissionManager(mode=Mode.DEFAULT)
+        self.deny_count = 0
 
     def set_tools(self, tools: List[BaseTool]) -> None:
         self.tools = tools
@@ -109,7 +114,43 @@ class BaseAgent:
 
                     try:
                         tool = tool_map[tool_name]
-                        tool_result = tool.run(**parsed_args)
+                        decision = self.permission_manager.check(
+                            tool=tool,
+                            kwargs=parsed_args,
+                            current_mode=self.permission_manager.mode,
+                        )
+                        if not decision.allowed:
+                            self.deny_count += 1
+                            tool_result = f"执行被权限系统拒绝：{decision.reason}。请调整方案。"
+                        else:
+                            if decision.needs_approval:
+                                approval = input(
+                                    f"[安全审核] Agent 请求执行 {tool_name}({parsed_args})。是否允许？[y/N]: "
+                                ).strip().lower()
+                                if approval not in {"y", "yes"}:
+                                    self.deny_count += 1
+                                    tool_result = "执行被用户拒绝，请调整方案。"
+                                else:
+                                    tool_result = tool.run(**parsed_args)
+                                    self.deny_count = 0
+                            else:
+                                tool_result = tool.run(**parsed_args)
+                                self.deny_count = 0
+
+                        if self.deny_count >= 3:
+                            severe_warning = (
+                                "你已连续多次触发安全限制，当前任务中止，请重新审视你的目标。"
+                            )
+                            run_messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "name": tool_name,
+                                    "content": severe_warning,
+                                }
+                            )
+                            self.messages = run_messages
+                            return severe_warning
                     except KeyError:
                         tool_result = f"工具调用失败：未注册的工具 {tool_name}。"
                     except Exception as exc:  # noqa: BLE001
@@ -160,6 +201,8 @@ class TravelAgent(BaseAgent):
         llm_client: LLMClient,
         tools: Optional[List[BaseTool]] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        initial_budget: float = 15000.0,
+        mode: Mode = Mode.DEFAULT,
     ) -> None:
         super().__init__(
             name="Parent Agent",
@@ -168,8 +211,10 @@ class TravelAgent(BaseAgent):
             system_prompt=TRAVEL_AGENT_SYSTEM_PROMPT,
             max_iterations=20,
             messages=messages,
+            permission_manager=PermissionManager(mode=mode),
         )
         self.planner = PlanningManager()
+        self.budget_manager = BudgetManager(total_budget=initial_budget)
         self.skill_registry = SkillRegistry()
         self.artifact_manager = ArtifactManager()
         self.turn_index = 0
@@ -177,9 +222,13 @@ class TravelAgent(BaseAgent):
 
     @classmethod
     def create_with_default_tools(
-        cls, llm_client: LLMClient, settings: Settings
+        cls,
+        llm_client: LLMClient,
+        settings: Settings,
+        initial_budget: float = 15000.0,
+        mode: Mode = Mode.DEFAULT,
     ) -> "TravelAgent":
-        agent = cls(llm_client=llm_client)
+        agent = cls(llm_client=llm_client, initial_budget=initial_budget, mode=mode)
 
         # 延迟导入，避免 core.agent <-> tools.delegate_tool 循环依赖。
         from tools.delegate_tool import DelegateTaskTool
@@ -191,14 +240,15 @@ class TravelAgent(BaseAgent):
             turn_getter=lambda: agent.turn_index,
             skill_registry=agent.skill_registry,
             artifact_manager=agent.artifact_manager,
+            budget_manager=agent.budget_manager,
         )
 
         parent_tools = [
-            tool_factories["weather"](),
-            tool_factories["poi"](),
             tool_factories["plan"](),
+            tool_factories["budget"](),
             tool_factories["skill"](),
             tool_factories["write_report"](),
+            tool_factories["export_ics"](),
             DelegateTaskTool(parent_agent=agent, tool_factories=tool_factories),
         ]
         agent.set_tools(parent_tools)
@@ -224,8 +274,11 @@ class TravelAgent(BaseAgent):
             TRAVEL_AGENT_SYSTEM_PROMPT,
             "",
             "你必须遵循：当用户提出复杂、多步骤旅游任务时，第一步先调用 `update_plan` 拆解任务。",
+            "父智能体不具备底层互联网检索权限，遇到天气/酒店/景点等数据查询必须调用 `delegate_task`。",
             "当出现酒店/住宿多条件筛选与对比任务时，必须调用 `delegate_task` 让子智能体执行。",
             self.planner.render_plan(),
+            "",
+            self.budget_manager.render_ledger(),
             "",
             skill_catalog_text,
             "请根据计划执行下一步；若实际进展变化，请优先调用 `update_plan` 更新状态。",
@@ -239,6 +292,9 @@ class TravelAgent(BaseAgent):
 
     def get_plan_overview(self) -> str:
         return self.planner.render_plan()
+
+    def get_budget_overview(self) -> str:
+        return self.budget_manager.render_ledger()
 
     def run(self, task_prompt: str) -> str:
         self.turn_index += 1

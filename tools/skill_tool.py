@@ -13,6 +13,7 @@ class LoadSkillTool(BaseTool):
 
     name = "load_skill"
     description = "按技能名称加载扩展知识正文，避免系统提示词过长。"
+    safety_level = "safe"
 
     def __init__(self, skill_registry: SkillRegistry) -> None:
         self.skill_registry = skill_registry

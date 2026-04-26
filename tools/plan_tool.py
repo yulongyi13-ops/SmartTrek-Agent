@@ -13,6 +13,7 @@ class UpdatePlanTool(BaseTool):
 
     name = "update_plan"
     description = "更新任务计划步骤及状态（todo/in_progress/completed）。"
+    safety_level = "write"
 
     def __init__(self, planner: PlanningManager, turn_getter: Callable[[], int]) -> None:
         self.planner = planner

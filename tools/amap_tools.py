@@ -61,11 +61,49 @@ class AmapPOIResponse(BaseModel):
     pois: List[AmapPOIItem] = Field(default_factory=list)
 
 
+class AmapGeocodeItem(BaseModel):
+    """地理编码结果。"""
+
+    location: str = ""
+
+
+class AmapGeocodeResponse(BaseModel):
+    """地理编码 API 响应模型。"""
+
+    status: str
+    info: str = "未知错误"
+    geocodes: List[AmapGeocodeItem] = Field(default_factory=list)
+
+
+class AmapDrivingPath(BaseModel):
+    """驾车路径核心字段。"""
+
+    distance: str = "0"  # 单位米
+    duration: str = "0"  # 单位秒
+    taxi_cost: str | None = None
+
+
+class AmapDrivingRoute(BaseModel):
+    """驾车路径主体。"""
+
+    paths: List[AmapDrivingPath] = Field(default_factory=list)
+    taxi_cost: str | None = None
+
+
+class AmapDrivingResponse(BaseModel):
+    """驾车规划 API 响应模型。"""
+
+    status: str
+    info: str = "未知错误"
+    route: AmapDrivingRoute = Field(default_factory=AmapDrivingRoute)
+
+
 class WeatherTool(BaseTool):
     """天气查询工具（调用高德天气 API）。"""
 
     name = "get_weather_forecast"
     description = "查询指定城市的天气预报信息（未来几天）。"
+    safety_level = "safe"
 
     _endpoint = "https://restapi.amap.com/v3/weather/weatherInfo"
 
@@ -152,6 +190,7 @@ class POISearchTool(BaseTool):
 
     name = "search_poi"
     description = "在指定城市按关键字搜索地点，可用于查酒店和景点。"
+    safety_level = "safe"
 
     _endpoint = "https://restapi.amap.com/v3/place/text"
 
@@ -242,3 +281,117 @@ class POISearchTool(BaseTool):
             lines.append(f"{idx}. {name} - {address}{extra_text}")
 
         return "\n".join(lines)
+
+
+class RoutePlanningTool(BaseTool):
+    """路径规划与通勤耗时估算工具。"""
+
+    name = "plan_route"
+    description = "根据起点和终点估算驾车通勤距离、时间和打车成本。"
+    safety_level = "safe"
+
+    _geocode_endpoint = "https://restapi.amap.com/v3/geocode/geo"
+    _driving_endpoint = "https://restapi.amap.com/v3/direction/driving"
+
+    def __init__(self, amap_api_key: str) -> None:
+        self.amap_api_key = amap_api_key
+
+    def to_openai_tool_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": (
+                    "用于规划同城两地点间的通勤路线与耗时。"
+                    "会先将地名转换为经纬度，再进行驾车路径估算。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "origin": {
+                            "type": "string",
+                            "description": "起点名称或地址，例如成都市武侯祠。",
+                        },
+                        "destination": {
+                            "type": "string",
+                            "description": "终点名称或地址，例如成都大熊猫繁育研究基地。",
+                        },
+                        "city": {
+                            "type": "string",
+                            "description": "城市名称，用于地理编码提高准确率。",
+                        },
+                    },
+                    "required": ["origin", "destination", "city"],
+                },
+            },
+        }
+
+    def _geocode(self, address: str, city: str) -> str:
+        params = {
+            "address": address,
+            "city": city,
+            "key": self.amap_api_key,
+        }
+        resp = requests.get(self._geocode_endpoint, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        parsed = AmapGeocodeResponse.model_validate(data)
+        if parsed.status != "1" or not parsed.geocodes:
+            raise ValueError(f"地理编码失败：{parsed.info}（address={address}）")
+        location = parsed.geocodes[0].location.strip()
+        if not location or "," not in location:
+            raise ValueError(f"地理编码失败：未返回有效坐标（address={address}）")
+        return location
+
+    def run(self, **kwargs: Any) -> str:
+        origin = str(kwargs.get("origin", "")).strip()
+        destination = str(kwargs.get("destination", "")).strip()
+        city = str(kwargs.get("city", "")).strip()
+        if not origin or not destination or not city:
+            return "路径规划失败：缺少 origin、destination 或 city 参数。"
+
+        try:
+            # 第一步：地理编码（名称 -> 经纬度）
+            origin_lnglat = self._geocode(address=origin, city=city)
+            destination_lnglat = self._geocode(address=destination, city=city)
+
+            # 第二步：驾车路径规划（估算打车/驾车通勤时间）
+            params = {
+                "origin": origin_lnglat,
+                "destination": destination_lnglat,
+                "key": self.amap_api_key,
+                "extensions": "all",
+            }
+            resp = requests.get(self._driving_endpoint, params=params, timeout=12)
+            resp.raise_for_status()
+            data = resp.json()
+            parsed = AmapDrivingResponse.model_validate(data)
+        except requests.RequestException as exc:
+            return f"路径规划失败，请检查网络或地点名。错误信息: {exc}"
+        except ValidationError as exc:
+            return f"路径规划失败：返回数据结构异常，错误信息: {exc}"
+        except ValueError as exc:
+            return f"路径规划失败：{exc}"
+        except Exception as exc:  # noqa: BLE001
+            return f"路径规划失败：请求过程中发生未知错误，错误信息: {exc}"
+
+        if parsed.status != "1":
+            return f"路径规划失败：{parsed.info}"
+        if not parsed.route.paths:
+            return "路径规划失败：未获取到有效路径。"
+
+        best_path = parsed.route.paths[0]
+        distance_m = float(best_path.distance or "0")
+        duration_s = float(best_path.duration or "0")
+        distance_km = round(distance_m / 1000, 1)
+        duration_min = max(1, int(round(duration_s / 60)))
+        taxi_cost = (
+            best_path.taxi_cost
+            or parsed.route.taxi_cost
+            or "暂无估算"
+        )
+
+        return (
+            f"从 [{origin}] 到 [{destination}] 的驾车距离约为 {distance_km} 公里，"
+            f"预估通行时间约为 {duration_min} 分钟。打车预估花费: {taxi_cost} 元。"
+        )

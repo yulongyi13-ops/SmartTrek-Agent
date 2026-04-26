@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from core.security import PermissionManager
+
 
 class ArtifactManager:
     """将长文本保存到本地文件，并返回短预览。"""
@@ -15,7 +17,7 @@ class ArtifactManager:
 
     def save_artifact(self, filename: str, content: str) -> str:
         safe_name = filename.strip() or "artifact.md"
-        target = self.artifact_dir / safe_name
+        target = PermissionManager.enforce_artifact_path(self.artifact_dir, safe_name)
         target.write_text(content, encoding="utf-8")
 
         preview_head = content[:80].replace("\n", " ")

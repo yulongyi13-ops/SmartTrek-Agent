@@ -17,6 +17,8 @@ class BaseTool(ABC):
 
     name: str
     description: str
+    safety_level: str = "safe"
+    requires_human_approval: bool = False
 
     @abstractmethod
     def to_openai_tool_schema(self) -> Dict[str, Any]:
