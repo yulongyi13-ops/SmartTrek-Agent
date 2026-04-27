@@ -16,7 +16,14 @@ from core.llm_client import LLMClient
 from core.long_term_memory import MemoryManager as LongTermMemoryManager
 from core.memory_manager import MemoryManager
 from core.planner import PlanningManager
+from core.recovery import (
+    RecoveryDecision,
+    RecoveryState,
+    analyze_and_recover,
+    apply_recovery_side_effect,
+)
 from core.security import Mode, PermissionManager
+from core.security import SecurityException
 from hooks import LoggingHook, PermissionCheckHook, StateInjectionHook, TimeInjectionHook
 from prompts.builder import SystemPromptBuilder
 from skills.registry import SkillRegistry
@@ -91,6 +98,51 @@ class BaseAgent:
         summary = (response.choices[0].message.content or "").strip()
         return summary or draft
 
+    def _call_llm_with_recovery(
+        self, context: RunContext, tool_schemas: Optional[List[Dict[str, Any]]]
+    ) -> Any:
+        """带自愈循环的 LLM 调用。"""
+        recovery_state = RecoveryState()
+
+        while True:
+            try:
+                response = self.llm_client.chat(messages=context.messages, tools=tool_schemas or None)
+            except Exception as exc:  # noqa: BLE001
+                decision = analyze_and_recover(exc, recovery_state, context)
+                if decision == RecoveryDecision.ABORT:
+                    raise SecurityException(
+                        f"LLM 调用失败且超过恢复阈值，错误类型={recovery_state.last_error_type}"
+                    ) from exc
+                apply_recovery_side_effect(
+                    decision=decision,
+                    state=recovery_state,
+                    context=context,
+                    memory_manager=self.memory_manager,
+                    llm_client=self.llm_client,
+                )
+                continue
+
+            finish_reason = str(response.choices[0].finish_reason or "").lower()
+            if finish_reason in {"length", "max_tokens"}:
+                decision = analyze_and_recover(response, recovery_state, context)
+                if decision == RecoveryDecision.ABORT:
+                    raise SecurityException(
+                        f"LLM 输出截断且超过恢复阈值，错误类型={recovery_state.last_error_type}"
+                    )
+                apply_recovery_side_effect(
+                    decision=decision,
+                    state=recovery_state,
+                    context=context,
+                    memory_manager=self.memory_manager,
+                    llm_client=self.llm_client,
+                )
+                continue
+
+            if recovery_state.accumulated_content:
+                merged = recovery_state.accumulated_content + (response.choices[0].message.content or "")
+                response.choices[0].message.content = merged
+            return response
+
     def run(self, task_prompt: str) -> str:
         """执行单次任务。子 Agent 的中间过程不会回写父 Agent。"""
         run_messages = self._build_run_messages(task_prompt)
@@ -104,6 +156,7 @@ class BaseAgent:
             metadata={
                 "permission_manager": self.permission_manager,
                 "deny_count": self.deny_count,
+                "available_tools": self.tools,
             },
         )
         self.hook_manager.trigger(AgentEvent.ON_RUN_START, context)
@@ -113,7 +166,7 @@ class BaseAgent:
             self.hook_manager.trigger(AgentEvent.ON_LLM_START, context)
             run_messages = self.memory_manager.compress_messages(context.messages, self.llm_client)
             context.messages = run_messages
-            response = self.llm_client.chat(messages=context.messages, tools=tool_schemas or None)
+            response = self._call_llm_with_recovery(context=context, tool_schemas=tool_schemas)
             context.llm_response = response
             self.hook_manager.trigger(AgentEvent.ON_LLM_END, context)
             choice = response.choices[0]
@@ -335,6 +388,7 @@ class TravelAgent(BaseAgent):
                 "budget_manager": self.budget_manager,
                 "planner": self.planner,
                 "force_plan_reminder": force_reminder,
+                "available_tools": self.tools,
             },
         )
         self.hook_manager.trigger(AgentEvent.ON_RUN_START, context)
@@ -359,7 +413,7 @@ class TravelAgent(BaseAgent):
             self.hook_manager.trigger(AgentEvent.ON_LLM_START, context)
             run_messages = self.memory_manager.compress_messages(context.messages, self.llm_client)
             context.messages = run_messages
-            response = self.llm_client.chat(messages=context.messages, tools=tool_schemas or None)
+            response = self._call_llm_with_recovery(context=context, tool_schemas=tool_schemas)
             context.llm_response = response
             self.hook_manager.trigger(AgentEvent.ON_LLM_END, context)
             choice = response.choices[0]

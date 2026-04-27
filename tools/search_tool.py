@@ -30,6 +30,8 @@ class WebSearchTool(BaseTool):
     name = "web_search"
     description = "警告：绝对禁止用此工具直接搜索“XX城市三日游攻略”。本工具仅限用于查询具体的票务、营业状态、政策及实时避雷评价。"
     safety_level = "safe"
+    base_weight = 10
+    capabilities = ["攻略", "价格", "票务", "新闻", "评价"]
 
     _endpoint = "https://api.tavily.com/search"
 

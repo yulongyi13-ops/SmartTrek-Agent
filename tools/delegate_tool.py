@@ -6,6 +6,7 @@ import copy
 from datetime import datetime
 from typing import Any, Callable, Dict, List
 
+from core.tool_scorer import calculate_dynamic_weights
 from core.security import PermissionManager
 from tools.base_tool import BaseTool
 
@@ -94,22 +95,43 @@ class DelegateTaskTool(BaseTool):
         if invalid:
             return f"委派失败：存在未注册工具键名 {invalid}。"
 
+        # 动态任务-工具亲和度纠偏：强制合并高优工具。
+        candidate_tools = [factory() for factory in self.tool_factories.values()]
+        weight_map = calculate_dynamic_weights(candidate_tools, sub_task_description)
+        high_priority_tool_names = [tool_name for tool_name, score in weight_map.items() if score >= 80]
+        auto_injected = [name for name in high_priority_tool_names if name not in resolved_tools]
+        if auto_injected:
+            resolved_tools = list(dict.fromkeys([*resolved_tools, *auto_injected]))
+
         try:
             from core.agent import BaseAgent  # 局部导入，规避循环依赖
 
             print("\033[95m[Parent Agent] 决定委派任务...\033[0m")
+            print(
+                f"\033[90m[DelegateTaskTool] required_tools={normalized_tools} -> "
+                f"resolved={resolved_tools}, injected={auto_injected}\033[0m"
+            )
 
             child_tools = [self.tool_factories[name]() for name in resolved_tools]
             parent_messages = self.parent_agent.get_messages_snapshot()
             context_tail = copy.deepcopy(parent_messages[-6:])
             planning_state = self.parent_agent.get_plan_overview()
 
+            tool_manifest_lines = ["子智能体可用工具清单（含动态评分）："]
+            for tool in child_tools:
+                score = weight_map.get(tool.name, getattr(tool, "base_weight", 30))
+                tool_manifest_lines.append(
+                    f"- {tool.name}: score={score}, capabilities={getattr(tool, 'capabilities', [])}"
+                )
+
             child_prompt = (
                 f"你是一个专注于执行子任务的子智能体。\n"
                 f"子任务目标：{sub_task_description}\n"
                 "请只使用授权工具完成任务，并输出精简且包含关键数据的结果总结。\n"
                 "如果失败，明确写出失败原因与可重试建议。\n"
-                f"\n父级计划状态参考：\n{planning_state}"
+                "优先使用高分工具，避免直接使用低优兜底工具作为首选。\n"
+                f"\n父级计划状态参考：\n{planning_state}\n\n"
+                + "\n".join(tool_manifest_lines)
             )
 
             child_agent = BaseAgent(
@@ -131,6 +153,13 @@ class DelegateTaskTool(BaseTool):
             print("\033[95m[Parent Agent] 收到子任务结果，更新计划...\033[0m")
 
             # Layer 1：大结果落盘，只把预览放回父 Agent 上下文。
+            prefix = ""
+            if auto_injected:
+                prefix = (
+                    "[系统日志：检测到您委派的任务需要高精度数据，系统已自动为子 Agent 挂载高优工具。"
+                    "以下是执行结果...]\n"
+                )
+
             if len(child_result) > 900:
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"child_report_{stamp}.md"
@@ -138,8 +167,8 @@ class DelegateTaskTool(BaseTool):
                     filename=filename,
                     content=child_result,
                 )
-                return f"子任务完成（长结果已落盘）：{preview}"
+                return f"{prefix}子任务完成（长结果已落盘）：{preview}"
 
-            return f"子任务完成：{child_result}"
+            return f"{prefix}子任务完成：{child_result}"
         except Exception as exc:  # noqa: BLE001
             return f"委派执行失败：{exc}"

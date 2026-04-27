@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, List
 
 from core.events import RunContext
+from core.tool_scorer import calculate_dynamic_weights
 
 
 class PromptSection(str, Enum):
@@ -75,6 +76,50 @@ class SystemPromptBuilder:
             ]
         )
 
+    def _extract_active_task_text(self, planner: Any) -> str:
+        if planner is None or not hasattr(planner, "steps"):
+            return ""
+        active_steps = []
+        for step in getattr(planner, "steps", []):
+            if getattr(step, "status", "") == "in_progress":
+                active_steps.append(getattr(step, "task_description", ""))
+        return "；".join(item for item in active_steps if item).strip()
+
+    def _render_tooling_section(self, planner: Any, available_tools: List[Any]) -> str:
+        task_text = self._extract_active_task_text(planner)
+        tools = [tool for tool in available_tools if hasattr(tool, "name")]
+        weight_map = calculate_dynamic_weights(tools=tools, task_text=task_text)
+
+        tool_by_name = {tool.name: tool for tool in tools}
+        t1 = []
+        t2 = []
+        t3 = []
+        for tool_name, score in sorted(weight_map.items(), key=lambda item: item[1], reverse=True):
+            tool = tool_by_name[tool_name]
+            line = f"- `{tool_name}` (score={score}, base={getattr(tool, 'base_weight', 30)})"
+            if score >= 80:
+                t1.append(line)
+            elif score >= 30:
+                t2.append(line)
+            else:
+                t3.append(line)
+
+        lines = [
+            self.tooling_text,
+            "",
+            f"当前计划任务文本: {task_text or '无 in_progress 步骤，使用基础权重。'}",
+            "",
+            "【🔥 当前强烈推荐工具】系统判定这些工具与当前计划高度匹配，**你必须优先使用**它们：",
+            *(t1 or ["- 暂无"]),
+            "",
+            "【常驻流程工具】：",
+            *(t2 or ["- 暂无"]),
+            "",
+            "【⚠️ 低优兜底工具】警告：仅当高优工具无效时才允许作为备用，禁止直接用作首选：",
+            *(t3 or ["- 暂无"]),
+        ]
+        return "\n".join(lines)
+
     def build(
         self,
         context: RunContext,
@@ -98,7 +143,9 @@ class SystemPromptBuilder:
         sections.append(self._render_section(PromptSection.SOP, sop_text))
 
         # 3) 工具与权限
-        sections.append(self._render_section(PromptSection.TOOLING, self.tooling_text))
+        available_tools = context.metadata.get("available_tools", [])
+        tooling_text = self._render_tooling_section(planner=planner, available_tools=available_tools)
+        sections.append(self._render_section(PromptSection.TOOLING, tooling_text))
 
         # 4) 技能目录
         manifests = skill_registry.get_all_manifests() if skill_registry else []

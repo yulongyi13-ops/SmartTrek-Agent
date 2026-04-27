@@ -104,6 +104,8 @@ class WeatherTool(BaseTool):
     name = "get_weather_forecast"
     description = "查询指定城市的天气预报信息（未来几天）。这是获取精确地理、距离和气象数据的唯一合法途径，规划路线时优先使用。"
     safety_level = "safe"
+    base_weight = 50
+    capabilities = ["天气", "气象", "降雨", "气温", "weather"]
 
     _endpoint = "https://restapi.amap.com/v3/weather/weatherInfo"
 
@@ -191,6 +193,8 @@ class POISearchTool(BaseTool):
     name = "search_poi"
     description = "在指定城市按关键字搜索地点，可用于查酒店和景点。这是获取精确地理、距离和气象数据的唯一合法途径，规划路线时优先使用。"
     safety_level = "safe"
+    base_weight = 50
+    capabilities = ["酒店", "住宿", "景点", "位置", "附近", "poi"]
 
     _endpoint = "https://restapi.amap.com/v3/place/text"
 
@@ -289,6 +293,8 @@ class RoutePlanningTool(BaseTool):
     name = "plan_route"
     description = "根据起点和终点估算驾车通勤距离、时间和打车成本。"
     safety_level = "safe"
+    base_weight = 50
+    capabilities = ["距离", "通勤", "耗时", "路线", "交通"]
 
     _geocode_endpoint = "https://restapi.amap.com/v3/geocode/geo"
     _driving_endpoint = "https://restapi.amap.com/v3/direction/driving"

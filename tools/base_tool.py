@@ -19,6 +19,8 @@ class BaseTool(ABC):
     description: str
     safety_level: str = "safe"
     requires_human_approval: bool = False
+    base_weight: int = 30
+    capabilities: List[str] = []
 
     @abstractmethod
     def to_openai_tool_schema(self) -> Dict[str, Any]:
