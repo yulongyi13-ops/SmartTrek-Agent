@@ -6,7 +6,6 @@ import copy
 from datetime import datetime
 from typing import Any, Callable, Dict, List
 
-from core.tool_scorer import calculate_dynamic_weights
 from core.security import PermissionManager
 from tools.base_tool import BaseTool
 
@@ -84,6 +83,7 @@ class DelegateTaskTool(BaseTool):
             "routeplanning": "route",
             "search": "web_search",
             "websearch": "web_search",
+            "web search": "web_search",
             "tavily": "web_search",
         }
         resolved_tools = [alias_map.get(name, name) for name in normalized_tools]
@@ -96,10 +96,18 @@ class DelegateTaskTool(BaseTool):
             return f"委派失败：存在未注册工具键名 {invalid}。"
 
         # 动态任务-工具亲和度纠偏：强制合并高优工具。
+        from core.tool_scorer import calculate_dynamic_weights
+
         candidate_tools = [factory() for factory in self.tool_factories.values()]
         weight_map = calculate_dynamic_weights(candidate_tools, sub_task_description)
         high_priority_tool_names = [tool_name for tool_name, score in weight_map.items() if score >= 80]
-        auto_injected = [name for name in high_priority_tool_names if name not in resolved_tools]
+        tool_name_to_factory_key = {
+            factory().name: key for key, factory in self.tool_factories.items()
+        }
+        injected_factory_keys = [
+            tool_name_to_factory_key.get(tool_name, tool_name) for tool_name in high_priority_tool_names
+        ]
+        auto_injected = [name for name in injected_factory_keys if name not in resolved_tools]
         if auto_injected:
             resolved_tools = list(dict.fromkeys([*resolved_tools, *auto_injected]))
 
@@ -112,6 +120,9 @@ class DelegateTaskTool(BaseTool):
                 f"resolved={resolved_tools}, injected={auto_injected}\033[0m"
             )
 
+            invalid_after_injection = [name for name in resolved_tools if name not in self.tool_factories]
+            if invalid_after_injection:
+                return f"委派失败：注入后存在未注册工具键名 {invalid_after_injection}。"
             child_tools = [self.tool_factories[name]() for name in resolved_tools]
             parent_messages = self.parent_agent.get_messages_snapshot()
             context_tail = copy.deepcopy(parent_messages[-6:])

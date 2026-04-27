@@ -483,6 +483,19 @@ class TravelAgent(BaseAgent):
 
             candidate = (assistant_message.content or "").strip()
             if candidate or finish_reason == "stop":
+                # 若最终文本已包含金额，但仍无记账记录，则强制回合继续，先完成记账再收尾。
+                if re.search(r"\d+(?:\.\d+)?\s*元", candidate) and not self.budget_manager.expenses:
+                    run_messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "检测到你已给出包含金额的最终方案，但账本仍为空。"
+                                "请先调用 `record_expense` 记录所有已确定花费，再输出最终结果。"
+                            ),
+                        }
+                    )
+                    context.messages = run_messages
+                    continue
                 final_content = candidate or "任务已完成。"
                 break
 

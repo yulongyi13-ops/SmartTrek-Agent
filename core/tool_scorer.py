@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Any, Dict, List, TYPE_CHECKING
 
-from tools.base_tool import BaseTool
+if TYPE_CHECKING:
+    from tools.base_tool import BaseTool
 
 
-def calculate_dynamic_weights(tools: List[BaseTool], task_text: str) -> Dict[str, int]:
+def calculate_dynamic_weights(tools: List["BaseTool"] | List[Any], task_text: str) -> Dict[str, int]:
     """根据任务文本和工具能力标签计算动态得分。"""
     normalized_text = (task_text or "").strip().lower()
     weights: Dict[str, int] = {}
