@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 from config.settings import Settings
 from core.artifact_manager import ArtifactManager
 from core.budget_manager import BudgetManager
+from core.events import AgentEvent, RunContext
+from core.hooks import HookManager
 from core.llm_client import LLMClient
+from core.long_term_memory import MemoryManager as LongTermMemoryManager
 from core.memory_manager import MemoryManager
 from core.planner import PlanningManager
 from core.security import Mode, PermissionManager
+from hooks import LoggingHook, PermissionCheckHook, StateInjectionHook, TimeInjectionHook
+from prompts.builder import SystemPromptBuilder
 from skills.registry import SkillRegistry
-from prompts.system_prompts import TRAVEL_AGENT_SYSTEM_PROMPT
 from tools.base_tool import BaseTool
 
 
@@ -44,6 +49,11 @@ class BaseAgent:
         self.memory_manager = memory_manager or MemoryManager()
         self.permission_manager = permission_manager or PermissionManager(mode=Mode.DEFAULT)
         self.deny_count = 0
+        self.hook_manager = HookManager()
+        self.hook_manager.add_hook(TimeInjectionHook())
+        self.hook_manager.add_hook(StateInjectionHook())
+        self.hook_manager.add_hook(PermissionCheckHook())
+        self.hook_manager.add_hook(LoggingHook())
 
     def set_tools(self, tools: List[BaseTool]) -> None:
         self.tools = tools
@@ -63,9 +73,6 @@ class BaseAgent:
         run_messages.insert(0, {"role": "system", "content": self.system_prompt})
         run_messages.append({"role": "user", "content": task_prompt})
         return run_messages
-
-    def _log_tool_call(self, tool_name: str) -> None:
-        print(f"\033[90m[{self.name}] 正在调用工具 {tool_name} ...\033[0m")
 
     def _summarize_for_child(self, run_messages: List[Dict[str, Any]], draft: str) -> str:
         """子 Agent 结束前强制做一次无工具总结，提炼关键信息。"""
@@ -91,20 +98,33 @@ class BaseAgent:
         tool_schemas = self._tool_schemas()
         final_content = ""
         used_tools: List[str] = []
+        context = RunContext(
+            agent_name=self.name,
+            messages=run_messages,
+            metadata={
+                "permission_manager": self.permission_manager,
+                "deny_count": self.deny_count,
+            },
+        )
+        self.hook_manager.trigger(AgentEvent.ON_RUN_START, context)
 
         for _ in range(self.max_iterations):
             # 发送到模型前先做压缩：system + rolling summary + working memory。
-            run_messages = self.memory_manager.compress_messages(run_messages, self.llm_client)
-            response = self.llm_client.chat(messages=run_messages, tools=tool_schemas or None)
+            self.hook_manager.trigger(AgentEvent.ON_LLM_START, context)
+            run_messages = self.memory_manager.compress_messages(context.messages, self.llm_client)
+            context.messages = run_messages
+            response = self.llm_client.chat(messages=context.messages, tools=tool_schemas or None)
+            context.llm_response = response
+            self.hook_manager.trigger(AgentEvent.ON_LLM_END, context)
             choice = response.choices[0]
             assistant_message = choice.message
             finish_reason = choice.finish_reason
             run_messages.append(assistant_message.model_dump(exclude_none=True))
+            context.messages = run_messages
 
             if assistant_message.tool_calls:
                 for tool_call in assistant_message.tool_calls:
                     tool_name = tool_call.function.name
-                    self._log_tool_call(tool_name)
                     used_tools.append(tool_name)
                     raw_args = tool_call.function.arguments or "{}"
                     try:
@@ -114,29 +134,22 @@ class BaseAgent:
 
                     try:
                         tool = tool_map[tool_name]
-                        decision = self.permission_manager.check(
-                            tool=tool,
-                            kwargs=parsed_args,
-                            current_mode=self.permission_manager.mode,
-                        )
-                        if not decision.allowed:
-                            self.deny_count += 1
-                            tool_result = f"执行被权限系统拒绝：{decision.reason}。请调整方案。"
-                        else:
-                            if decision.needs_approval:
-                                approval = input(
-                                    f"[安全审核] Agent 请求执行 {tool_name}({parsed_args})。是否允许？[y/N]: "
-                                ).strip().lower()
-                                if approval not in {"y", "yes"}:
-                                    self.deny_count += 1
-                                    tool_result = "执行被用户拒绝，请调整方案。"
-                                else:
-                                    tool_result = tool.run(**parsed_args)
-                                    self.deny_count = 0
-                            else:
-                                tool_result = tool.run(**parsed_args)
-                                self.deny_count = 0
-
+                        context.current_tool = tool
+                        context.kwargs = parsed_args
+                        self.hook_manager.trigger(AgentEvent.ON_TOOL_START, context)
+                        tool_result = tool.run(**parsed_args)
+                        self.deny_count = 0
+                        context.metadata["deny_count"] = self.deny_count
+                    except KeyError:
+                        tool_result = f"工具调用失败：未注册的工具 {tool_name}。"
+                        context.metadata["last_error"] = tool_result
+                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
+                    except PermissionError as exc:
+                        self.deny_count += 1
+                        context.metadata["deny_count"] = self.deny_count
+                        tool_result = str(exc)
+                        context.metadata["last_error"] = tool_result
+                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
                         if self.deny_count >= 3:
                             severe_warning = (
                                 "你已连续多次触发安全限制，当前任务中止，请重新审视你的目标。"
@@ -151,10 +164,10 @@ class BaseAgent:
                             )
                             self.messages = run_messages
                             return severe_warning
-                    except KeyError:
-                        tool_result = f"工具调用失败：未注册的工具 {tool_name}。"
                     except Exception as exc:  # noqa: BLE001
                         tool_result = f"工具调用失败：{tool_name} 执行异常，错误信息: {exc}"
+                        context.metadata["last_error"] = tool_result
+                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
 
                     run_messages.append(
                         {
@@ -164,6 +177,8 @@ class BaseAgent:
                             "content": tool_result,
                         }
                     )
+                    context.messages = run_messages
+                    self.hook_manager.trigger(AgentEvent.ON_TOOL_END, context)
                 continue
 
             candidate = (assistant_message.content or "").strip()
@@ -201,22 +216,24 @@ class TravelAgent(BaseAgent):
         llm_client: LLMClient,
         tools: Optional[List[BaseTool]] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
-        initial_budget: float = 15000.0,
+        initial_budget: float = 50000.0,
         mode: Mode = Mode.DEFAULT,
     ) -> None:
         super().__init__(
             name="Parent Agent",
             llm_client=llm_client,
             tools=tools,
-            system_prompt=TRAVEL_AGENT_SYSTEM_PROMPT,
-            max_iterations=20,
+            system_prompt="你是一个专业、耐心的旅游规划助手。",
+            max_iterations=50,
             messages=messages,
             permission_manager=PermissionManager(mode=mode),
         )
         self.planner = PlanningManager()
-        self.budget_manager = BudgetManager(total_budget=initial_budget)
+        self.budget_manager = BudgetManager(total_assets=initial_budget)
+        self.long_term_memory = LongTermMemoryManager()
         self.skill_registry = SkillRegistry()
         self.artifact_manager = ArtifactManager()
+        self.prompt_builder = SystemPromptBuilder()
         self.turn_index = 0
         self.turns_since_update = 0
 
@@ -225,7 +242,7 @@ class TravelAgent(BaseAgent):
         cls,
         llm_client: LLMClient,
         settings: Settings,
-        initial_budget: float = 15000.0,
+        initial_budget: float = 50000.0,
         mode: Mode = Mode.DEFAULT,
     ) -> "TravelAgent":
         agent = cls(llm_client=llm_client, initial_budget=initial_budget, mode=mode)
@@ -241,12 +258,15 @@ class TravelAgent(BaseAgent):
             skill_registry=agent.skill_registry,
             artifact_manager=agent.artifact_manager,
             budget_manager=agent.budget_manager,
+            long_term_memory_manager=agent.long_term_memory,
         )
 
         parent_tools = [
             tool_factories["plan"](),
+            tool_factories["set_task_budget"](),
             tool_factories["budget"](),
             tool_factories["skill"](),
+            tool_factories["update_memory"](),
             tool_factories["write_report"](),
             tool_factories["export_ics"](),
             DelegateTaskTool(parent_agent=agent, tool_factories=tool_factories),
@@ -254,57 +274,174 @@ class TravelAgent(BaseAgent):
         agent.set_tools(parent_tools)
         return agent
 
-    def _build_dynamic_system_prompt(self, force_plan_reminder: bool) -> str:
-        manifests = self.skill_registry.get_all_manifests()
-        if manifests:
-            skill_lines = [
-                "【可用领域知识技能库】",
-                "你可以使用 LoadSkillTool 加载以下扩展知识：",
-            ]
-            for item in manifests:
-                skill_lines.append(f"- [{item.name}]: {item.description}")
-            skill_catalog_text = "\n".join(skill_lines)
-        else:
-            skill_catalog_text = (
-                "【可用领域知识技能库】\n当前未发现技能文档。"
-                "如需扩展，请在 skills/data/ 目录新增 .md 文件。"
-            )
-
-        sections = [
-            TRAVEL_AGENT_SYSTEM_PROMPT,
-            "",
-            "你必须遵循：当用户提出复杂、多步骤旅游任务时，第一步先调用 `update_plan` 拆解任务。",
-            "父智能体不具备底层互联网检索权限，遇到天气/酒店/景点等数据查询必须调用 `delegate_task`。",
-            "当出现酒店/住宿多条件筛选与对比任务时，必须调用 `delegate_task` 让子智能体执行。",
-            self.planner.render_plan(),
-            "",
-            self.budget_manager.render_ledger(),
-            "",
-            skill_catalog_text,
-            "请根据计划执行下一步；若实际进展变化，请优先调用 `update_plan` 更新状态。",
-            "若最终输出很长，请调用 `write_report_file` 将完整版写入文件，并在回复中给摘要与文件路径。",
-        ]
-        if force_plan_reminder:
-            sections.append(
-                "【系统强制提醒】检测到计划已长时间未更新，请确认当前步骤是否已完成，并更新计划状态后再继续。"
-            )
-        return "\n".join(sections)
-
     def get_plan_overview(self) -> str:
         return self.planner.render_plan()
 
     def get_budget_overview(self) -> str:
         return self.budget_manager.render_ledger()
 
+    def _auto_extract_long_term_memory(self, task_prompt: str) -> None:
+        """从用户输入中自动提取高价值长期信息。"""
+        text = task_prompt.strip()
+        patterns = [
+            r"我在(?P<city>[\u4e00-\u9fa5]{2,10})上学",
+            r"我在(?P<city>[\u4e00-\u9fa5]{2,10})工作",
+            r"我常住(?P<city>[\u4e00-\u9fa5]{2,10})",
+            r"我长期住在(?P<city>[\u4e00-\u9fa5]{2,10})",
+            r"我在(?P<city>[\u4e00-\u9fa5]{2,10})读书",
+        ]
+        for p in patterns:
+            match = re.search(p, text)
+            if match:
+                city = match.group("city")
+                self.long_term_memory.update_memory(
+                    category="conventions",
+                    action="update",
+                    key="常驻出发地",
+                    value=city,
+                )
+                self.long_term_memory.save_to_disk()
+                break
+
+    def _auto_set_task_budget(self, task_prompt: str) -> None:
+        """自动识别用户在本次输入中的专项预算。"""
+        text = task_prompt.strip()
+        match = re.search(r"预算\s*([0-9]+(?:\.[0-9]+)?)\s*元?", text)
+        if match:
+            amount = float(match.group(1))
+            self.budget_manager.set_task_budget(amount)
+            return
+
+        if self.budget_manager.current_task_budget is None:
+            # 回退到总资产，避免因未设置任务预算导致预算工具不工作。
+            self.budget_manager.set_task_budget(self.budget_manager.total_assets)
+
     def run(self, task_prompt: str) -> str:
         self.turn_index += 1
-        self.system_prompt = self._build_dynamic_system_prompt(
-            force_plan_reminder=self.turns_since_update >= 3
+        self._auto_extract_long_term_memory(task_prompt)
+        self._auto_set_task_budget(task_prompt)
+        force_reminder = self.turns_since_update >= 3
+
+        run_messages = self._build_run_messages(task_prompt)
+        context = RunContext(
+            agent_name=self.name,
+            messages=run_messages,
+            metadata={
+                "permission_manager": self.permission_manager,
+                "deny_count": self.deny_count,
+                "prompt_builder": self.prompt_builder,
+                "memory_manager": self.long_term_memory,
+                "skill_registry": self.skill_registry,
+                "budget_manager": self.budget_manager,
+                "planner": self.planner,
+                "force_plan_reminder": force_reminder,
+            },
         )
-        result = super().run(task_prompt)
+        self.hook_manager.trigger(AgentEvent.ON_RUN_START, context)
+
+        result = self._run_with_context(context)
 
         if "update_plan" in self.last_run_tool_names:
             self.turns_since_update = 0
         else:
             self.turns_since_update += 1
         return result
+
+    def _run_with_context(self, context: RunContext) -> str:
+        """复用 BaseAgent.run 的主循环，但允许子类预置上下文 metadata。"""
+        run_messages = context.messages
+        tool_map = self._tool_map()
+        tool_schemas = self._tool_schemas()
+        final_content = ""
+        used_tools: List[str] = []
+
+        for _ in range(self.max_iterations):
+            self.hook_manager.trigger(AgentEvent.ON_LLM_START, context)
+            run_messages = self.memory_manager.compress_messages(context.messages, self.llm_client)
+            context.messages = run_messages
+            response = self.llm_client.chat(messages=context.messages, tools=tool_schemas or None)
+            context.llm_response = response
+            self.hook_manager.trigger(AgentEvent.ON_LLM_END, context)
+            choice = response.choices[0]
+            assistant_message = choice.message
+            finish_reason = choice.finish_reason
+            run_messages.append(assistant_message.model_dump(exclude_none=True))
+            context.messages = run_messages
+
+            if assistant_message.tool_calls:
+                for tool_call in assistant_message.tool_calls:
+                    tool_name = tool_call.function.name
+                    used_tools.append(tool_name)
+                    raw_args = tool_call.function.arguments or "{}"
+                    try:
+                        parsed_args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        parsed_args = {}
+
+                    try:
+                        tool = tool_map[tool_name]
+                        context.current_tool = tool
+                        context.kwargs = parsed_args
+                        self.hook_manager.trigger(AgentEvent.ON_TOOL_START, context)
+                        tool_result = tool.run(**parsed_args)
+                        self.deny_count = 0
+                        context.metadata["deny_count"] = self.deny_count
+                    except KeyError:
+                        tool_result = f"工具调用失败：未注册的工具 {tool_name}。"
+                        context.metadata["last_error"] = tool_result
+                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
+                    except PermissionError as exc:
+                        self.deny_count += 1
+                        context.metadata["deny_count"] = self.deny_count
+                        tool_result = str(exc)
+                        context.metadata["last_error"] = tool_result
+                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
+                        if self.deny_count >= 3:
+                            severe_warning = (
+                                "你已连续多次触发安全限制，当前任务中止，请重新审视你的目标。"
+                            )
+                            run_messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "name": tool_name,
+                                    "content": severe_warning,
+                                }
+                            )
+                            self.messages = run_messages
+                            return severe_warning
+                    except Exception as exc:  # noqa: BLE001
+                        tool_result = f"工具调用失败：{tool_name} 执行异常，错误信息: {exc}"
+                        context.metadata["last_error"] = tool_result
+                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
+
+                    run_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_name,
+                            "content": tool_result,
+                        }
+                    )
+                    context.messages = run_messages
+                    self.hook_manager.trigger(AgentEvent.ON_TOOL_END, context)
+                continue
+
+            candidate = (assistant_message.content or "").strip()
+            if candidate or finish_reason == "stop":
+                final_content = candidate or "任务已完成。"
+                break
+
+            run_messages.append(
+                {
+                    "role": "system",
+                    "content": "请输出最终完整结果，避免空内容。",
+                }
+            )
+
+        if not final_content:
+            final_content = f"执行失败：{self.name} 达到最大迭代次数({self.max_iterations})。"
+
+        self.last_run_tool_names = used_tools
+        self.messages = run_messages
+        return final_content

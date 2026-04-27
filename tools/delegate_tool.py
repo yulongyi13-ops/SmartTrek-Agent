@@ -15,17 +15,17 @@ class DelegateTaskTool(BaseTool):
 
     name = "delegate_task"
     description = (
-        "当且仅当你需要查询天气、搜索航班、查找酒店、搜索景点等具体外部信息时，"
+        "当且仅当你需要查询天气、搜索航班、查找酒店、搜索景点、门票价格与临时政策等具体外部信息时，"
         "必须调用此工具委派子智能体去完成。你自身没有直接访问外部互联网或地图 API 的权限。"
         "在委派时，请在 sub_task_description 中清晰描述你需要子智能体帮你查什么，"
-        "并在 required_tools 中传入子智能体需要的工具名称（如 ['weather', 'poi']）。"
+        "并在 required_tools 中传入子智能体需要的工具名称（如 ['web_search']、['weather', 'poi']）。"
     )
 
     def __init__(
         self,
         parent_agent: Any,
         tool_factories: Dict[str, Callable[[], BaseTool]],
-        child_max_iterations: int = 6,
+        child_max_iterations: int = 8,
     ) -> None:
         self.parent_agent = parent_agent
         self.tool_factories = tool_factories
@@ -37,10 +37,10 @@ class DelegateTaskTool(BaseTool):
             "function": {
                 "name": self.name,
                 "description": (
-                    "当且仅当你需要查询天气、搜索航班、查找酒店、搜索景点等具体外部信息时，"
+                    "当且仅当你需要查询天气、搜索航班、查找酒店、搜索景点、门票价格与临时政策等具体外部信息时，"
                     "必须调用此工具委派子智能体去完成。你自身没有直接访问外部互联网或地图 API 的权限。"
                     "在委派时，请在 sub_task_description 中清晰描述你需要子智能体帮你查什么，"
-                    "并在 required_tools 中传入子智能体需要的工具名称（如 ['weather', 'poi']）。"
+                    "并在 required_tools 中传入子智能体需要的工具名称（如 ['web_search']、['weather', 'poi']）。"
                 ),
                 "parameters": {
                     "type": "object",

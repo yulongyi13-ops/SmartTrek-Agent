@@ -48,12 +48,31 @@ def build_agent(mode: Mode) -> TravelAgent:
         model=settings.deepseek_model,
     )
 
+    budget = choose_initial_budget()
     return TravelAgent.create_with_default_tools(
         llm_client=llm_client,
         settings=settings,
-        initial_budget=15000.0,
+        initial_budget=budget,
         mode=mode,
     )
+
+
+def choose_initial_budget() -> float:
+    """启动时输入初始总资产。"""
+    while True:
+        raw = input("请输入系统初始总资产（元）[默认 50000]: ").strip()
+        if not raw:
+            print("已使用默认总资产: 50000.00 元")
+            return 50000.0
+        try:
+            value = float(raw)
+            if value < 0:
+                print("总资产不能为负数，请重输。")
+                continue
+            print(f"已设置总资产: {value:.2f} 元")
+            return value
+        except ValueError:
+            print("输入无效，请输入数字，例如 6000 或 50000。")
 
 
 def main() -> None:

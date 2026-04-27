@@ -13,7 +13,7 @@ env.bak/
 venv.bak/
 
 # 运行生成的临时文件或日志
-workspace/artifacts/
+workspace/
 *.log
 DEVELOPMENT_LOG.md
 # IDE 配置文件 (可选)

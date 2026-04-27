@@ -28,7 +28,7 @@ class WebSearchTool(BaseTool):
     """为 Agent 提供实时网络搜索能力。"""
 
     name = "web_search"
-    description = "查询实时攻略、票务动态、临时政策等最新网络信息。"
+    description = "警告：绝对禁止用此工具直接搜索“XX城市三日游攻略”。本工具仅限用于查询具体的票务、营业状态、政策及实时避雷评价。"
     safety_level = "safe"
 
     _endpoint = "https://api.tavily.com/search"
@@ -41,7 +41,7 @@ class WebSearchTool(BaseTool):
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": "联网搜索最新信息，并返回精简总结与来源摘要。",
+                "description": "警告：绝对禁止用此工具直接搜索“XX城市三日游攻略”。本工具仅限用于查询具体的票务、营业状态、政策及实时避雷评价，并返回精简总结与来源摘要。",
                 "parameters": {
                     "type": "object",
                     "properties": {

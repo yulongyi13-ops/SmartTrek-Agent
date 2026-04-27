@@ -34,7 +34,9 @@ class PermissionManager:
 
     _default_whitelist = {
         "update_plan",
+        "set_task_budget",
         "load_skill",
+        "update_memory",
         "delegate_task",
         "record_expense",
         "web_search",
