@@ -17,14 +17,12 @@ class StateInjectionHook(BaseHook):
         memory_manager = context.metadata.get("memory_manager")
         skill_registry = context.metadata.get("skill_registry")
         budget_manager = context.metadata.get("budget_manager")
-        planner = context.metadata.get("planner")
         prompt_text = str(
             prompt_builder.build(
                 context=context,
                 memory_manager=memory_manager,
                 skill_registry=skill_registry,
                 budget_manager=budget_manager,
-                planner=planner,
             )
         )
         if context.messages and context.messages[0].get("role") == "system":

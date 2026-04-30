@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import shutil
 from typing import Dict, List
 
 from pydantic import BaseModel, Field, ValidationError
@@ -43,7 +44,11 @@ class MemoryManager:
 
     def __init__(self, file_path: str | Path | None = None) -> None:
         project_root = Path(__file__).resolve().parent.parent
-        self.file_path = Path(file_path) if file_path else (project_root / "workspace" / "user_profile.json")
+        self.file_path = (
+            Path(file_path)
+            if file_path
+            else (project_root / "workspace" / "memory" / "user_profile.json")
+        )
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.profile = MemoryProfile()
         self._load_from_disk()
@@ -62,6 +67,18 @@ class MemoryManager:
         except (OSError, json.JSONDecodeError, ValidationError):
             # 容错：坏文件不让系统崩溃，回退为空画像。
             self.profile = MemoryProfile()
+
+    def migrate_legacy_profile(self) -> str:
+        """迁移旧版 user_profile.json 到 memory 目录（幂等）。"""
+        workspace_dir = self.file_path.parent.parent
+        legacy_path = workspace_dir / "user_profile.json"
+        if not legacy_path.exists():
+            return "no_legacy_profile"
+        if self.file_path.exists():
+            return "skip_existing_profile"
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(legacy_path), str(self.file_path))
+        return "moved_legacy_profile"
 
     def save_to_disk(self) -> None:
         payload = self.profile.model_dump()

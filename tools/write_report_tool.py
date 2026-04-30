@@ -12,7 +12,7 @@ class WriteReportTool(BaseTool):
     """把结果写入本地文件，减少对话输出长度。"""
 
     name = "write_report_file"
-    description = "将长篇结果保存到本地文件，并返回文件路径与简要预览。"
+    description = "将长篇结果保存到本地结果文件（workspace/results），并返回文件路径与简要预览。"
     safety_level = "dangerous"
     requires_human_approval = True
 

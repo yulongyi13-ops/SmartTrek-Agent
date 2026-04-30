@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, List
 
 from core.events import RunContext
+from core.task_manager import TaskStatus
 from core.tool_scorer import calculate_dynamic_weights
 
 
@@ -35,7 +36,8 @@ class SystemPromptBuilder:
         )
         self.tooling_text = "\n".join(
             [
-                "复杂任务第一步必须调用 `update_plan` 拆解步骤。",
+                "复杂任务第一步必须调用 `task_create` 拆解 DAG 任务，不允许跳过建档直接执行。",
+                "每次子任务执行完成后，必须立即调用 `task_update` 写入 result_summary 并推进状态流转。",
                 "遇到实时/外部数据查询，优先使用工具而非臆测。",
                 "涉及住宿筛选、候选对比与排序时，优先调用 `delegate_task`。",
                 "最终结果较长时，优先调用 `write_report_file` 输出完整文件并在回复给摘要。",
@@ -76,19 +78,36 @@ class SystemPromptBuilder:
             ]
         )
 
-    def _extract_active_task_text(self, planner: Any) -> str:
-        if planner is None or not hasattr(planner, "steps"):
+    def _extract_active_task_text(self, task_manager: Any) -> str:
+        if task_manager is None or not hasattr(task_manager, "get_ready_tasks"):
             return ""
-        active_steps = []
-        for step in getattr(planner, "steps", []):
-            if getattr(step, "status", "") == "in_progress":
-                active_steps.append(getattr(step, "task_description", ""))
-        return "；".join(item for item in active_steps if item).strip()
+        try:
+            ready_tasks = task_manager.get_ready_tasks()
+        except Exception:  # noqa: BLE001
+            return ""
+        return "；".join(task.subject for task in ready_tasks if getattr(task, "subject", "")).strip()
 
-    def _render_tooling_section(self, planner: Any, available_tools: List[Any]) -> str:
-        task_text = self._extract_active_task_text(planner)
+    def _render_tooling_section(self, task_manager: Any, available_tools: List[Any]) -> str:
+        task_text = self._extract_active_task_text(task_manager)
         tools = [tool for tool in available_tools if hasattr(tool, "name")]
         weight_map = calculate_dynamic_weights(tools=tools, task_text=task_text)
+        all_tasks = []
+        ready_tasks = []
+        if task_manager is not None:
+            try:
+                if hasattr(task_manager, "list_tasks"):
+                    all_tasks = task_manager.list_tasks()
+                if hasattr(task_manager, "get_ready_tasks"):
+                    ready_tasks = task_manager.get_ready_tasks()
+            except Exception:  # noqa: BLE001
+                all_tasks = []
+                ready_tasks = []
+
+        # DAG 流程强化：新需求优先 task_create；有待执行任务优先 delegate_task。
+        if not all_tasks and "task_create" in weight_map:
+            weight_map["task_create"] = 100
+        if ready_tasks and "delegate_task" in weight_map:
+            weight_map["delegate_task"] = 100
 
         tool_by_name = {tool.name: tool for tool in tools}
         t1 = []
@@ -107,7 +126,19 @@ class SystemPromptBuilder:
         lines = [
             self.tooling_text,
             "",
-            f"当前计划任务文本: {task_text or '无 in_progress 步骤，使用基础权重。'}",
+            "### 首席规划师标准作业程序 (SOP)",
+            "**阶段 1：工作流拆解与建档 (必须使用任务系统)**",
+            "在接到用户需求后，你绝对不能直接开始委派查询任务。第一步必须调用 `task_create` 工具，将宏大目标拆解为具体的子任务，并正确设置 `blockedBy` 依赖关系。",
+            "",
+            "**阶段 2：执行与状态流转**",
+            "1. 读取当前注入的【任务看板】，找到状态为 `pending` 且没有前置阻塞（`blockedBy` 为空）的任务。",
+            "2. 针对该任务，使用 `delegate_task` 委派子助手去获取真实数据。",
+            "3. 子助手返回数据后，必须立即调用 `task_update`：将任务状态改为 `completed`，并把核心数据摘要写入 `result_summary`。",
+            "",
+            "**阶段 3：循环推进**",
+            "重复阶段 2，直到看板中所有任务均为 `completed`，最后向用户输出完整报告。",
+            "",
+            f"当前任务看板文本: {task_text or '看板为空，优先使用 task_create。'}",
             "",
             "【🔥 当前强烈推荐工具】系统判定这些工具与当前计划高度匹配，**你必须优先使用**它们：",
             *(t1 or ["- 暂无"]),
@@ -120,13 +151,33 @@ class SystemPromptBuilder:
         ]
         return "\n".join(lines)
 
+    def _render_task_board(self, task_manager: Any) -> str:
+        if task_manager is None or not hasattr(task_manager, "get_ready_tasks"):
+            return "[当前待办看板] 任务管理器不可用。"
+        try:
+            ready_tasks = task_manager.get_ready_tasks()
+        except Exception:  # noqa: BLE001
+            return "[当前待办看板] 读取失败。"
+        if not ready_tasks:
+            return "[当前待办看板] 暂无可执行任务。"
+
+        items: List[str] = []
+        for task in ready_tasks:
+            if task.status == TaskStatus.IN_PROGRESS:
+                state_text = "进行中"
+            elif task.status == TaskStatus.PENDING:
+                state_text = "已解锁等待认领"
+            else:
+                state_text = task.status.value
+            items.append(f"{task.subject}({state_text}, id={task.id})")
+        return "[当前待办看板] " + " | ".join(items)
+
     def build(
         self,
         context: RunContext,
         memory_manager: Any,
         skill_registry: Any,
         budget_manager: Any,
-        planner: Any,
     ) -> str:
         """按优先级流水线渲染完整 System Message。"""
         sections: List[str] = []
@@ -144,7 +195,11 @@ class SystemPromptBuilder:
 
         # 3) 工具与权限
         available_tools = context.metadata.get("available_tools", [])
-        tooling_text = self._render_tooling_section(planner=planner, available_tools=available_tools)
+        task_manager = context.metadata.get("task_manager")
+        tooling_text = self._render_tooling_section(
+            task_manager=task_manager,
+            available_tools=available_tools,
+        )
         sections.append(self._render_section(PromptSection.TOOLING, tooling_text))
 
         # 4) 技能目录
@@ -168,20 +223,14 @@ class SystemPromptBuilder:
 
         # 6) 动态状态：时间 + 计划 + 账本 + 强提醒
         now_text = str(context.metadata.get("current_time_text", "未注入当前时间。"))
+        task_board_text = self._render_task_board(task_manager=task_manager)
         dynamic_lines = [
             f"系统时间锚点: {now_text}",
             "",
-            planner.render_plan() if planner else "计划管理器不可用。",
+            task_board_text,
             "",
             budget_manager.render_ledger() if budget_manager else "预算账本不可用。",
         ]
-        if context.metadata.get("force_plan_reminder"):
-            dynamic_lines.extend(
-                [
-                    "",
-                    "【系统强制提醒】计划已长时间未更新，请先更新计划状态再继续执行。",
-                ]
-            )
         sections.append(self._render_section(PromptSection.DYNAMIC, "\n".join(dynamic_lines)))
 
         # 7) 底部安全护栏

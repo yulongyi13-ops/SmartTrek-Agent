@@ -45,7 +45,7 @@ def build_agent(mode: Mode) -> TravelAgent:
     llm_client = LLMClient(
         api_key=settings.deepseek_api_key,
         base_url=settings.deepseek_base_url,
-        model=settings.deepseek_model,
+        model=settings.parent_model,
     )
 
     budget = choose_initial_budget()

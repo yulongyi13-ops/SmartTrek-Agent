@@ -9,6 +9,7 @@ from .export_tool import ExportIcsTool
 from .memory_tool import UpdateMemoryTool
 from .search_tool import WebSearchTool
 from .skill_tool import LoadSkillTool
+from .task_tools import TaskCreateTool, TaskGetTool, TaskListTool, TaskUpdateTool
 from .write_report_tool import WriteReportTool
 
 __all__ = [
@@ -26,4 +27,8 @@ __all__ = [
     "WebSearchTool",
     "LoadSkillTool",
     "WriteReportTool",
+    "TaskCreateTool",
+    "TaskUpdateTool",
+    "TaskGetTool",
+    "TaskListTool",
 ]

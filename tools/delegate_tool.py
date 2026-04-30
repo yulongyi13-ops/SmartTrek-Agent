@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import copy
+import itertools
+import threading
 from datetime import datetime
 from typing import Any, Callable, Dict, List
 
+from core.llm_client import LLMClient
 from core.security import PermissionManager
 from tools.base_tool import BaseTool
 
@@ -20,15 +23,19 @@ class DelegateTaskTool(BaseTool):
         "在委派时，请在 sub_task_description 中清晰描述你需要子智能体帮你查什么，"
         "并在 required_tools 中传入子智能体需要的工具名称（如 ['web_search']、['weather', 'poi']）。"
     )
+    _child_seq = itertools.count(1)
+    _child_seq_lock = threading.Lock()
 
     def __init__(
         self,
         parent_agent: Any,
         tool_factories: Dict[str, Callable[[], BaseTool]],
+        child_llm_client_builder: Callable[[], LLMClient],
         child_max_iterations: int = 8,
     ) -> None:
         self.parent_agent = parent_agent
         self.tool_factories = tool_factories
+        self.child_llm_client_builder = child_llm_client_builder
         self.child_max_iterations = child_max_iterations
 
     def to_openai_tool_schema(self) -> Dict[str, Any]:
@@ -141,13 +148,17 @@ class DelegateTaskTool(BaseTool):
                 "请只使用授权工具完成任务，并输出精简且包含关键数据的结果总结。\n"
                 "如果失败，明确写出失败原因与可重试建议。\n"
                 "优先使用高分工具，避免直接使用低优兜底工具作为首选。\n"
+                "【极其重要】你是一个无情的后台处理程序。你的输出必须极度精简，只返回核心数据结果，绝对不要包含任何礼貌用语、解释或多余的废话。\n"
                 f"\n父级计划状态参考：\n{planning_state}\n\n"
                 + "\n".join(tool_manifest_lines)
             )
+            with self._child_seq_lock:
+                child_index = next(self._child_seq)
+            child_name = f"Child Agent {child_index}"
 
             child_agent = BaseAgent(
-                name=f"Child Agent - {resolved_tools[0]}",
-                llm_client=self.parent_agent.llm_client,
+                name=child_name,
+                llm_client=self.child_llm_client_builder(),
                 tools=child_tools,
                 system_prompt=child_prompt,
                 max_iterations=self.child_max_iterations,
@@ -162,6 +173,10 @@ class DelegateTaskTool(BaseTool):
             child_result = child_agent.run(sub_task_description)
             print("\033[94m    [Child Agent - Task] 提取结果返回...\033[0m")
             print("\033[95m[Parent Agent] 收到子任务结果，更新计划...\033[0m")
+            post_delegate_reminder = (
+                "\n[系统提示：子任务已执行完毕。请立即调用 task_update 工具，将此任务标记为 completed，"
+                "并把以上核心数据填入 result_summary 中，以解锁后续任务！]"
+            )
 
             # Layer 1：大结果落盘，只把预览放回父 Agent 上下文。
             prefix = ""
@@ -174,12 +189,12 @@ class DelegateTaskTool(BaseTool):
             if len(child_result) > 900:
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"child_report_{stamp}.md"
-                preview = self.parent_agent.artifact_manager.save_artifact(
+                preview = self.parent_agent.artifact_manager.save_child_log(
                     filename=filename,
                     content=child_result,
                 )
-                return f"{prefix}子任务完成（长结果已落盘）：{preview}"
+                return f"{prefix}子任务完成（长结果已落盘）：{preview}{post_delegate_reminder}"
 
-            return f"{prefix}子任务完成：{child_result}"
+            return f"{prefix}子任务完成：{child_result}{post_delegate_reminder}"
         except Exception as exc:  # noqa: BLE001
             return f"委派执行失败：{exc}"

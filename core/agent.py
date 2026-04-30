@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 from config.settings import Settings
@@ -15,7 +16,6 @@ from core.hooks import HookManager
 from core.llm_client import LLMClient
 from core.long_term_memory import MemoryManager as LongTermMemoryManager
 from core.memory_manager import MemoryManager
-from core.planner import PlanningManager
 from core.recovery import (
     RecoveryDecision,
     RecoveryState,
@@ -24,6 +24,7 @@ from core.recovery import (
 )
 from core.security import Mode, PermissionManager
 from core.security import SecurityException
+from core.task_manager import Task, TaskManager, TaskStatus
 from hooks import LoggingHook, PermissionCheckHook, StateInjectionHook, TimeInjectionHook
 from prompts.builder import SystemPromptBuilder
 from skills.registry import SkillRegistry
@@ -83,6 +84,30 @@ class BaseAgent:
 
     def _summarize_for_child(self, run_messages: List[Dict[str, Any]], draft: str) -> str:
         """子 Agent 结束前强制做一次无工具总结，提炼关键信息。"""
+        tail_messages = run_messages[-8:]
+        normalized_tail: List[Dict[str, Any]] = []
+        valid_tool_call_ids = set()
+
+        # 只保留“assistant(tool_calls) -> tool(tool_call_id)”成对结构，避免 API 400。
+        for message in tail_messages:
+            role = message.get("role")
+            if role == "assistant":
+                tool_calls = message.get("tool_calls") or []
+                for call in tool_calls:
+                    call_id = call.get("id")
+                    if call_id:
+                        valid_tool_call_ids.add(call_id)
+                normalized_tail.append(message)
+                continue
+
+            if role == "tool":
+                tool_call_id = message.get("tool_call_id")
+                if tool_call_id and tool_call_id in valid_tool_call_ids:
+                    normalized_tail.append(message)
+                continue
+
+            normalized_tail.append(message)
+
         summary_messages = [
             {
                 "role": "system",
@@ -91,7 +116,7 @@ class BaseAgent:
                     "必须包含关键事实、关键数据、失败项（如有）。"
                 ),
             },
-            *run_messages[-8:],
+            *normalized_tail,
             {"role": "assistant", "content": draft},
         ]
         response = self.llm_client.chat(messages=summary_messages, tools=None)
@@ -143,6 +168,125 @@ class BaseAgent:
                 response.choices[0].message.content = merged
             return response
 
+    def _parse_tool_args(self, raw_args: str) -> Dict[str, Any]:
+        try:
+            return json.loads(raw_args or "{}")
+        except json.JSONDecodeError:
+            return {}
+
+    def _run_single_tool(self, tool_map: Dict[str, BaseTool], tool_name: str, parsed_args: Dict[str, Any]) -> str:
+        try:
+            tool = tool_map[tool_name]
+            return tool.run(**parsed_args)
+        except KeyError:
+            return f"工具调用失败：未注册的工具 {tool_name}。"
+        except Exception as exc:  # noqa: BLE001
+            return f"工具调用失败：{tool_name} 执行异常，错误信息: {exc}"
+
+    def _build_fanin_summary(self, rows: List[Dict[str, str]]) -> str:
+        lines = ["## 并发子任务汇总"]
+        for idx, row in enumerate(rows, start=1):
+            content = row["result"].replace("\n", " ").strip()
+            compact = content[:220] + ("..." if len(content) > 220 else "")
+            lines.append(f"- 任务{idx}（{row['tool_call_id']}）：{compact}")
+        return "\n".join(lines)
+
+    def _execute_tool_calls(
+        self,
+        context: RunContext,
+        assistant_message: Any,
+        run_messages: List[Dict[str, Any]],
+        tool_map: Dict[str, BaseTool],
+        used_tools: List[str],
+    ) -> Optional[str]:
+        tool_calls = assistant_message.tool_calls or []
+        delegate_only = bool(tool_calls) and all(
+            call.function.name == "delegate_task" for call in tool_calls
+        )
+
+        if delegate_only and len(tool_calls) > 1:
+            future_map = {}
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                for tool_call in tool_calls:
+                    tool_name = tool_call.function.name
+                    used_tools.append(tool_name)
+                    args = self._parse_tool_args(tool_call.function.arguments or "{}")
+                    future = executor.submit(self._run_single_tool, tool_map, tool_name, args)
+                    future_map[future] = tool_call.id
+
+                rows: List[Dict[str, str]] = []
+                for future in as_completed(future_map):
+                    call_id = future_map[future]
+                    rows.append({"tool_call_id": call_id, "result": future.result()})
+
+            rows.sort(key=lambda item: item["tool_call_id"])
+            summary = self._build_fanin_summary(rows)
+            primary_id = rows[0]["tool_call_id"]
+            for row in rows:
+                content = summary if row["tool_call_id"] == primary_id else f"并发结果已汇总到 {primary_id}"
+                run_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": row["tool_call_id"],
+                        "name": "delegate_task",
+                        "content": content,
+                    }
+                )
+            context.messages = run_messages
+            return None
+
+        for tool_call in tool_calls:
+            tool_name = tool_call.function.name
+            used_tools.append(tool_name)
+            parsed_args = self._parse_tool_args(tool_call.function.arguments or "{}")
+
+            try:
+                tool = tool_map[tool_name]
+                context.current_tool = tool
+                context.kwargs = parsed_args
+                self.hook_manager.trigger(AgentEvent.ON_TOOL_START, context)
+                tool_result = tool.run(**parsed_args)
+                self.deny_count = 0
+                context.metadata["deny_count"] = self.deny_count
+            except KeyError:
+                tool_result = f"工具调用失败：未注册的工具 {tool_name}。"
+                context.metadata["last_error"] = tool_result
+                self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
+            except PermissionError as exc:
+                self.deny_count += 1
+                context.metadata["deny_count"] = self.deny_count
+                tool_result = str(exc)
+                context.metadata["last_error"] = tool_result
+                self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
+                if self.deny_count >= 3:
+                    severe_warning = "你已连续多次触发安全限制，当前任务中止，请重新审视你的目标。"
+                    run_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_name,
+                            "content": severe_warning,
+                        }
+                    )
+                    self.messages = run_messages
+                    return severe_warning
+            except Exception as exc:  # noqa: BLE001
+                tool_result = f"工具调用失败：{tool_name} 执行异常，错误信息: {exc}"
+                context.metadata["last_error"] = tool_result
+                self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
+
+            run_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_name,
+                    "content": tool_result,
+                }
+            )
+            context.messages = run_messages
+            self.hook_manager.trigger(AgentEvent.ON_TOOL_END, context)
+        return None
+
     def run(self, task_prompt: str) -> str:
         """执行单次任务。子 Agent 的中间过程不会回写父 Agent。"""
         run_messages = self._build_run_messages(task_prompt)
@@ -176,62 +320,15 @@ class BaseAgent:
             context.messages = run_messages
 
             if assistant_message.tool_calls:
-                for tool_call in assistant_message.tool_calls:
-                    tool_name = tool_call.function.name
-                    used_tools.append(tool_name)
-                    raw_args = tool_call.function.arguments or "{}"
-                    try:
-                        parsed_args = json.loads(raw_args)
-                    except json.JSONDecodeError:
-                        parsed_args = {}
-
-                    try:
-                        tool = tool_map[tool_name]
-                        context.current_tool = tool
-                        context.kwargs = parsed_args
-                        self.hook_manager.trigger(AgentEvent.ON_TOOL_START, context)
-                        tool_result = tool.run(**parsed_args)
-                        self.deny_count = 0
-                        context.metadata["deny_count"] = self.deny_count
-                    except KeyError:
-                        tool_result = f"工具调用失败：未注册的工具 {tool_name}。"
-                        context.metadata["last_error"] = tool_result
-                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
-                    except PermissionError as exc:
-                        self.deny_count += 1
-                        context.metadata["deny_count"] = self.deny_count
-                        tool_result = str(exc)
-                        context.metadata["last_error"] = tool_result
-                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
-                        if self.deny_count >= 3:
-                            severe_warning = (
-                                "你已连续多次触发安全限制，当前任务中止，请重新审视你的目标。"
-                            )
-                            run_messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "name": tool_name,
-                                    "content": severe_warning,
-                                }
-                            )
-                            self.messages = run_messages
-                            return severe_warning
-                    except Exception as exc:  # noqa: BLE001
-                        tool_result = f"工具调用失败：{tool_name} 执行异常，错误信息: {exc}"
-                        context.metadata["last_error"] = tool_result
-                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
-
-                    run_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_name,
-                            "content": tool_result,
-                        }
-                    )
-                    context.messages = run_messages
-                    self.hook_manager.trigger(AgentEvent.ON_TOOL_END, context)
+                severe_warning = self._execute_tool_calls(
+                    context=context,
+                    assistant_message=assistant_message,
+                    run_messages=run_messages,
+                    tool_map=tool_map,
+                    used_tools=used_tools,
+                )
+                if severe_warning:
+                    return severe_warning
                 continue
 
             candidate = (assistant_message.content or "").strip()
@@ -281,14 +378,15 @@ class TravelAgent(BaseAgent):
             messages=messages,
             permission_manager=PermissionManager(mode=mode),
         )
-        self.planner = PlanningManager()
         self.budget_manager = BudgetManager(total_assets=initial_budget)
         self.long_term_memory = LongTermMemoryManager()
         self.skill_registry = SkillRegistry()
         self.artifact_manager = ArtifactManager()
+        self.task_manager = TaskManager()
         self.prompt_builder = SystemPromptBuilder()
+        self.artifact_manager.migrate_legacy_outputs()
+        self.long_term_memory.migrate_legacy_profile()
         self.turn_index = 0
-        self.turns_since_update = 0
 
     @classmethod
     def create_with_default_tools(
@@ -306,29 +404,60 @@ class TravelAgent(BaseAgent):
 
         tool_factories = build_tool_factories(
             settings=settings,
-            planner=agent.planner,
-            turn_getter=lambda: agent.turn_index,
             skill_registry=agent.skill_registry,
             artifact_manager=agent.artifact_manager,
             budget_manager=agent.budget_manager,
             long_term_memory_manager=agent.long_term_memory,
+            task_manager=agent.task_manager,
         )
 
         parent_tools = [
-            tool_factories["plan"](),
             tool_factories["set_task_budget"](),
             tool_factories["budget"](),
             tool_factories["skill"](),
             tool_factories["update_memory"](),
             tool_factories["write_report"](),
             tool_factories["export_ics"](),
-            DelegateTaskTool(parent_agent=agent, tool_factories=tool_factories),
+            tool_factories["task_create"](),
+            tool_factories["task_update"](),
+            tool_factories["task_get"](),
+            tool_factories["task_list"](),
+            DelegateTaskTool(
+                parent_agent=agent,
+                tool_factories=tool_factories,
+                child_llm_client_builder=lambda: LLMClient(
+                    api_key=settings.deepseek_api_key,
+                    base_url=settings.deepseek_base_url,
+                    model=settings.child_model,
+                ),
+            ),
         ]
         agent.set_tools(parent_tools)
         return agent
 
+    def _render_task_snapshot(self) -> str:
+        tasks = self.task_manager.list_tasks()
+        if not tasks:
+            return "### 当前任务看板\n- 暂无任务（请先调用 `task_create` 拆解目标）"
+
+        def _sort_key(item: Task) -> tuple[int, str]:
+            status_order = {
+                TaskStatus.IN_PROGRESS: 0,
+                TaskStatus.PENDING: 1,
+                TaskStatus.COMPLETED: 2,
+                TaskStatus.DELETED: 3,
+            }
+            return (status_order.get(item.status, 9), item.id)
+
+        lines = ["### 当前任务看板"]
+        for task in sorted(tasks, key=_sort_key):
+            lines.append(
+                f"- [{task.status.value}] {task.subject} (id={task.id}, blockedBy={task.blockedBy or []})"
+            )
+        return "\n".join(lines)
+
     def get_plan_overview(self) -> str:
-        return self.planner.render_plan()
+        return self._render_task_snapshot()
 
     def get_budget_overview(self) -> str:
         return self.budget_manager.render_ledger()
@@ -373,7 +502,6 @@ class TravelAgent(BaseAgent):
         self.turn_index += 1
         self._auto_extract_long_term_memory(task_prompt)
         self._auto_set_task_budget(task_prompt)
-        force_reminder = self.turns_since_update >= 3
 
         run_messages = self._build_run_messages(task_prompt)
         context = RunContext(
@@ -386,19 +514,13 @@ class TravelAgent(BaseAgent):
                 "memory_manager": self.long_term_memory,
                 "skill_registry": self.skill_registry,
                 "budget_manager": self.budget_manager,
-                "planner": self.planner,
-                "force_plan_reminder": force_reminder,
+                "task_manager": self.task_manager,
                 "available_tools": self.tools,
             },
         )
         self.hook_manager.trigger(AgentEvent.ON_RUN_START, context)
 
         result = self._run_with_context(context)
-
-        if "update_plan" in self.last_run_tool_names:
-            self.turns_since_update = 0
-        else:
-            self.turns_since_update += 1
         return result
 
     def _run_with_context(self, context: RunContext) -> str:
@@ -423,62 +545,15 @@ class TravelAgent(BaseAgent):
             context.messages = run_messages
 
             if assistant_message.tool_calls:
-                for tool_call in assistant_message.tool_calls:
-                    tool_name = tool_call.function.name
-                    used_tools.append(tool_name)
-                    raw_args = tool_call.function.arguments or "{}"
-                    try:
-                        parsed_args = json.loads(raw_args)
-                    except json.JSONDecodeError:
-                        parsed_args = {}
-
-                    try:
-                        tool = tool_map[tool_name]
-                        context.current_tool = tool
-                        context.kwargs = parsed_args
-                        self.hook_manager.trigger(AgentEvent.ON_TOOL_START, context)
-                        tool_result = tool.run(**parsed_args)
-                        self.deny_count = 0
-                        context.metadata["deny_count"] = self.deny_count
-                    except KeyError:
-                        tool_result = f"工具调用失败：未注册的工具 {tool_name}。"
-                        context.metadata["last_error"] = tool_result
-                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
-                    except PermissionError as exc:
-                        self.deny_count += 1
-                        context.metadata["deny_count"] = self.deny_count
-                        tool_result = str(exc)
-                        context.metadata["last_error"] = tool_result
-                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
-                        if self.deny_count >= 3:
-                            severe_warning = (
-                                "你已连续多次触发安全限制，当前任务中止，请重新审视你的目标。"
-                            )
-                            run_messages.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "name": tool_name,
-                                    "content": severe_warning,
-                                }
-                            )
-                            self.messages = run_messages
-                            return severe_warning
-                    except Exception as exc:  # noqa: BLE001
-                        tool_result = f"工具调用失败：{tool_name} 执行异常，错误信息: {exc}"
-                        context.metadata["last_error"] = tool_result
-                        self.hook_manager.trigger(AgentEvent.ON_ERROR, context)
-
-                    run_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_name,
-                            "content": tool_result,
-                        }
-                    )
-                    context.messages = run_messages
-                    self.hook_manager.trigger(AgentEvent.ON_TOOL_END, context)
+                severe_warning = self._execute_tool_calls(
+                    context=context,
+                    assistant_message=assistant_message,
+                    run_messages=run_messages,
+                    tool_map=tool_map,
+                    used_tools=used_tools,
+                )
+                if severe_warning:
+                    return severe_warning
                 continue
 
             candidate = (assistant_message.content or "").strip()

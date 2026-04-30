@@ -33,11 +33,14 @@ class PermissionManager:
     """工具执行权限控制器。"""
 
     _default_whitelist = {
-        "update_plan",
         "set_task_budget",
         "load_skill",
         "update_memory",
         "delegate_task",
+        "task_create",
+        "task_update",
+        "task_get",
+        "task_list",
         "record_expense",
         "web_search",
         "get_weather_forecast",
