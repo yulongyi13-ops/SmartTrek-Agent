@@ -6,7 +6,7 @@ import copy
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from config.settings import Settings
 from core.artifact_manager import ArtifactManager
@@ -15,6 +15,7 @@ from core.events import AgentEvent, RunContext
 from core.hooks import HookManager
 from core.llm_client import LLMClient
 from core.long_term_memory import MemoryManager as LongTermMemoryManager
+from core.mcp_manager import MCPManager
 from core.memory_manager import MemoryManager
 from core.recovery import (
     RecoveryDecision,
@@ -198,13 +199,24 @@ class BaseAgent:
         run_messages: List[Dict[str, Any]],
         tool_map: Dict[str, BaseTool],
         used_tools: List[str],
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Optional[str]:
+        def _emit(ev: Dict[str, Any]) -> None:
+            if progress_callback is not None:
+                progress_callback(ev)
+
         tool_calls = assistant_message.tool_calls or []
         delegate_only = bool(tool_calls) and all(
             call.function.name == "delegate_task" for call in tool_calls
         )
 
         if delegate_only and len(tool_calls) > 1:
+            _emit(
+                {
+                    "type": "node",
+                    "message": f"并发启动 {len(tool_calls)} 个 delegate_task 子任务…",
+                }
+            )
             future_map = {}
             with ThreadPoolExecutor(max_workers=3) as executor:
                 for tool_call in tool_calls:
@@ -218,6 +230,13 @@ class BaseAgent:
                 for future in as_completed(future_map):
                     call_id = future_map[future]
                     rows.append({"tool_call_id": call_id, "result": future.result()})
+                    short_id = (call_id or "")[:10]
+                    _emit(
+                        {
+                            "type": "node",
+                            "message": f"一路 delegate_task 已完成（call …{short_id}）",
+                        }
+                    )
 
             rows.sort(key=lambda item: item["tool_call_id"])
             summary = self._build_fanin_summary(rows)
@@ -239,13 +258,28 @@ class BaseAgent:
             tool_name = tool_call.function.name
             used_tools.append(tool_name)
             parsed_args = self._parse_tool_args(tool_call.function.arguments or "{}")
+            _emit({"type": "node", "message": f"正在执行工具 `{tool_name}` …"})
+            _emit(
+                {
+                    "type": "log",
+                    "message": f"`{tool_name}` 参数摘要: {str(parsed_args)[:200]}",
+                    "tool": tool_name,
+                    "phase": "tool_start",
+                }
+            )
 
             try:
                 tool = tool_map[tool_name]
                 context.current_tool = tool
                 context.kwargs = parsed_args
                 self.hook_manager.trigger(AgentEvent.ON_TOOL_START, context)
-                tool_result = tool.run(**parsed_args)
+                if tool_name.startswith("mcp_"):
+                    mcp_manager = context.metadata.get("mcp_manager")
+                    if mcp_manager is None:
+                        raise RuntimeError("MCP 管理器不可用，无法执行 MCP 工具。")
+                    tool_result = mcp_manager.call_tool(tool_name, parsed_args)
+                else:
+                    tool_result = tool.run(**parsed_args)
                 self.deny_count = 0
                 context.metadata["deny_count"] = self.deny_count
             except KeyError:
@@ -285,6 +319,15 @@ class BaseAgent:
             )
             context.messages = run_messages
             self.hook_manager.trigger(AgentEvent.ON_TOOL_END, context)
+            preview = (tool_result or "")[:160].replace("\n", " ")
+            _emit(
+                {
+                    "type": "log",
+                    "message": f"`{tool_name}` 完成，结果预览: {preview}{'…' if len(tool_result or '') > 160 else ''}",
+                    "tool": tool_name,
+                    "phase": "tool_end",
+                }
+            )
         return None
 
     def run(self, task_prompt: str) -> str:
@@ -301,6 +344,7 @@ class BaseAgent:
                 "permission_manager": self.permission_manager,
                 "deny_count": self.deny_count,
                 "available_tools": self.tools,
+                "mcp_manager": getattr(self, "mcp_manager", None),
             },
         )
         self.hook_manager.trigger(AgentEvent.ON_RUN_START, context)
@@ -368,6 +412,7 @@ class TravelAgent(BaseAgent):
         messages: Optional[List[Dict[str, Any]]] = None,
         initial_budget: float = 50000.0,
         mode: Mode = Mode.DEFAULT,
+        mcp_manager: Optional[MCPManager] = None,
     ) -> None:
         super().__init__(
             name="Parent Agent",
@@ -384,6 +429,7 @@ class TravelAgent(BaseAgent):
         self.artifact_manager = ArtifactManager()
         self.task_manager = TaskManager()
         self.prompt_builder = SystemPromptBuilder()
+        self.mcp_manager = mcp_manager
         self.artifact_manager.migrate_legacy_outputs()
         self.long_term_memory.migrate_legacy_profile()
         self.turn_index = 0
@@ -400,7 +446,11 @@ class TravelAgent(BaseAgent):
 
         # 延迟导入，避免 core.agent <-> tools.delegate_tool 循环依赖。
         from tools.delegate_tool import DelegateTaskTool
-        from tools.registry import build_tool_factories
+        from tools.registry import build_mcp_parent_tools, build_tool_factories
+
+        mcp_manager = MCPManager(config_path=settings.mcp_config_path)
+        mcp_manager.start_all()
+        agent.mcp_manager = mcp_manager
 
         tool_factories = build_tool_factories(
             settings=settings,
@@ -432,8 +482,13 @@ class TravelAgent(BaseAgent):
                 ),
             ),
         ]
+        parent_tools.extend(build_mcp_parent_tools(mcp_manager=agent.mcp_manager))
         agent.set_tools(parent_tools)
         return agent
+
+    def close(self) -> None:
+        if self.mcp_manager is not None:
+            self.mcp_manager.stop_all()
 
     def _render_task_snapshot(self) -> str:
         tasks = self.task_manager.list_tasks()
@@ -516,6 +571,7 @@ class TravelAgent(BaseAgent):
                 "budget_manager": self.budget_manager,
                 "task_manager": self.task_manager,
                 "available_tools": self.tools,
+                "mcp_manager": self.mcp_manager,
             },
         )
         self.hook_manager.trigger(AgentEvent.ON_RUN_START, context)
@@ -523,15 +579,61 @@ class TravelAgent(BaseAgent):
         result = self._run_with_context(context)
         return result
 
+    def iter_run_events(self, task_prompt: str) -> Iterator[Dict[str, Any]]:
+        """流式产出规划进度（node / log / text_delta）与最终 `final` 事件；供 Streamlit 等 UI 消费。"""
+        self.turn_index += 1
+        self._auto_extract_long_term_memory(task_prompt)
+        self._auto_set_task_budget(task_prompt)
+
+        run_messages = self._build_run_messages(task_prompt)
+        context = RunContext(
+            agent_name=self.name,
+            messages=run_messages,
+            metadata={
+                "permission_manager": self.permission_manager,
+                "deny_count": self.deny_count,
+                "prompt_builder": self.prompt_builder,
+                "memory_manager": self.long_term_memory,
+                "skill_registry": self.skill_registry,
+                "budget_manager": self.budget_manager,
+                "task_manager": self.task_manager,
+                "available_tools": self.tools,
+                "mcp_manager": self.mcp_manager,
+                "emit_stream_events": True,
+                "synthetic_stream_chunk_size": 48,
+            },
+        )
+        self.hook_manager.trigger(AgentEvent.ON_RUN_START, context)
+        try:
+            yield from self._iter_run_with_context(context)
+        except Exception as exc:  # noqa: BLE001
+            yield {"type": "error", "message": str(exc)}
+            yield {"type": "final", "text": f"Agent 运行出错: {exc}"}
+
     def _run_with_context(self, context: RunContext) -> str:
-        """复用 BaseAgent.run 的主循环，但允许子类预置上下文 metadata。"""
+        """同步执行：消费事件流直至 `final`（不向调用方暴露中间事件）。"""
+        final_text = ""
+        for ev in self._iter_run_with_context(context):
+            if ev.get("type") == "final":
+                final_text = str(ev.get("text", ""))
+        return final_text
+
+    def _iter_run_with_context(self, context: RunContext) -> Iterator[Dict[str, Any]]:
+        """主规划循环：产出结构化事件；终稿使用基于缓冲文本的分块 text_delta（避免双次 LLM）。"""
         run_messages = context.messages
         tool_map = self._tool_map()
         tool_schemas = self._tool_schemas()
         final_content = ""
         used_tools: List[str] = []
+        emit_stream = bool(context.metadata.get("emit_stream_events", False))
+        chunk_sz = max(8, int(context.metadata.get("synthetic_stream_chunk_size", 48) or 48))
 
-        for _ in range(self.max_iterations):
+        for iter_idx in range(self.max_iterations):
+            yield {
+                "type": "log",
+                "message": f"第 {iter_idx + 1}/{self.max_iterations} 轮：压缩上下文并请求模型…",
+                "phase": "llm_round",
+            }
             self.hook_manager.trigger(AgentEvent.ON_LLM_START, context)
             run_messages = self.memory_manager.compress_messages(context.messages, self.llm_client)
             context.messages = run_messages
@@ -545,21 +647,31 @@ class TravelAgent(BaseAgent):
             context.messages = run_messages
 
             if assistant_message.tool_calls:
+                progress_buf: List[Dict[str, Any]] = []
                 severe_warning = self._execute_tool_calls(
                     context=context,
                     assistant_message=assistant_message,
                     run_messages=run_messages,
                     tool_map=tool_map,
                     used_tools=used_tools,
+                    progress_callback=progress_buf.append,
                 )
+                for ev in progress_buf:
+                    yield ev
                 if severe_warning:
-                    return severe_warning
+                    self.last_run_tool_names = used_tools
+                    yield {"type": "final", "text": severe_warning}
+                    return
                 continue
 
             candidate = (assistant_message.content or "").strip()
             if candidate or finish_reason == "stop":
-                # 若最终文本已包含金额，但仍无记账记录，则强制回合继续，先完成记账再收尾。
                 if re.search(r"\d+(?:\.\d+)?\s*元", candidate) and not self.budget_manager.expenses:
+                    yield {
+                        "type": "log",
+                        "message": "检测到方案含金额但账本为空，要求模型先记账再继续。",
+                        "phase": "budget_gate",
+                    }
                     run_messages.append(
                         {
                             "role": "system",
@@ -571,9 +683,14 @@ class TravelAgent(BaseAgent):
                     )
                     context.messages = run_messages
                     continue
+                yield {"type": "node", "message": "正在输出最终行程方案…"}
+                if emit_stream and candidate:
+                    for i in range(0, len(candidate), chunk_sz):
+                        yield {"type": "text_delta", "text": candidate[i : i + chunk_sz]}
                 final_content = candidate or "任务已完成。"
                 break
 
+            yield {"type": "log", "message": "模型返回空内容，已注入重试提示。", "phase": "empty_reply"}
             run_messages.append(
                 {
                     "role": "system",
@@ -586,4 +703,4 @@ class TravelAgent(BaseAgent):
 
         self.last_run_tool_names = used_tools
         self.messages = run_messages
-        return final_content
+        yield {"type": "final", "text": final_content}

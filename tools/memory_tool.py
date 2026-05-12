@@ -45,6 +45,16 @@ class UpdateMemoryTool(BaseTool):
                         },
                         "key": {"type": "string"},
                         "value": {"type": "string"},
+                        "condition": {
+                            "type": "string",
+                            "description": "记忆生效场景，默认全局通用，如：穷游时、爬山时。",
+                            "default": "全局通用",
+                        },
+                        "conflict_resolution": {
+                            "type": "string",
+                            "enum": ["overwrite_global", "add_as_exception"],
+                            "description": "冲突处理策略：全局覆盖或新增特例。",
+                        },
                     },
                     "required": ["category", "action", "key"],
                 },
@@ -56,12 +66,16 @@ class UpdateMemoryTool(BaseTool):
         action = str(kwargs.get("action", "")).strip()
         key = str(kwargs.get("key", "")).strip()
         value = str(kwargs.get("value", "")).strip()
+        condition = str(kwargs.get("condition", "全局通用")).strip() or "全局通用"
+        conflict_resolution = str(kwargs.get("conflict_resolution", "")).strip()
         try:
             msg = self.memory_manager.update_memory(
                 category=category,
                 action=action,
                 key=key,
                 value=value,
+                condition=condition,
+                conflict_resolution=conflict_resolution,
             )
             # 仅当更新动作正常执行时落盘；失败消息也可落盘保持一致，这里选择总是保存当前状态。
             self.memory_manager.save_to_disk()

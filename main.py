@@ -80,26 +80,29 @@ def main() -> None:
     mode = choose_mode()
     agent = build_agent(mode=mode)
 
-    while True:
-        user_input = input("\n你: ").strip()
-        if not user_input:
-            continue
-        if user_input.lower() in {"exit", "quit"}:
-            print("已退出。")
-            break
+    try:
+        while True:
+            user_input = input("\n你: ").strip()
+            if not user_input:
+                continue
+            if user_input.lower() in {"exit", "quit"}:
+                print("已退出。")
+                break
 
-        print("Agent: 正在思考并可能调用工具...")
-        try:
-            reply = agent.run(user_input)
-            print(f"{COLOR_GREEN}Agent: {reply}{COLOR_RESET}")
-            print(f"{COLOR_CYAN}\n--- PlanningState 概览 ---")
-            print(agent.get_plan_overview())
-            print("\n--- Budget Ledger 概览 ---")
-            print(agent.get_budget_overview())
-            print(f"-------------------------{COLOR_RESET}")
-        except Exception as exc:  # noqa: BLE001
-            # 在实践项目里保留异常输出，方便调试 Agent 链路。
-            print(f"Agent 运行出错: {exc}")
+            print("Agent: 正在思考并可能调用工具...")
+            try:
+                reply = agent.run(user_input)
+                print(f"{COLOR_GREEN}Agent: {reply}{COLOR_RESET}")
+                print(f"{COLOR_CYAN}\n--- PlanningState 概览 ---")
+                print(agent.get_plan_overview())
+                print("\n--- Budget Ledger 概览 ---")
+                print(agent.get_budget_overview())
+                print(f"-------------------------{COLOR_RESET}")
+            except Exception as exc:  # noqa: BLE001
+                # 在实践项目里保留异常输出，方便调试 Agent 链路。
+                print(f"Agent 运行出错: {exc}")
+    finally:
+        agent.close()
 
 
 if __name__ == "__main__":

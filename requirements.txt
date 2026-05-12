@@ -3,3 +3,9 @@ python-dotenv
 requests
 pydantic
 icalendar
+fastapi
+uvicorn
+mcp
+streamlit
+folium
+streamlit-folium

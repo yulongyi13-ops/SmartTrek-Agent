@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from openai import OpenAI
 
@@ -36,3 +36,38 @@ class LLMClient:
             payload["tool_choice"] = "auto"
 
         return self.client.chat.completions.create(**payload)
+
+    def iter_chat_stream_text(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Iterator[str]:
+        """流式输出 assistant 文本 delta（仅 content 片段，不含 tool_calls 解析）。
+
+        工具轮仍应使用非流式 `chat`；终稿无工具时可调用本方法做 token 级流式。
+        若 API 在流中返回 tool_calls，本迭代器会忽略（调用方需保证 tools=None 或模型不返回工具）。
+        """
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        stream = self.client.chat.completions.create(**payload)
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta is None:
+                continue
+            piece = getattr(delta, "content", None) or ""
+            if piece:
+                yield piece
+
+    def chat_stream_collect(self, messages: List[Dict[str, Any]]) -> str:
+        """无工具流式调用并拼接完整文本；失败时抛出由调用方捕获。"""
+        return "".join(self.iter_chat_stream_text(messages, tools=None))

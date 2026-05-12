@@ -29,7 +29,7 @@ class ExportIcsTool(BaseTool):
     name = "export_ics"
     description = "将结构化行程导出为 .ics 日历文件并返回保存路径。"
     safety_level = "dangerous"
-    requires_human_approval = True
+    requires_human_approval = False
 
     def __init__(self, artifact_dir: str | Path | None = None) -> None:
         project_root = Path(__file__).resolve().parent.parent

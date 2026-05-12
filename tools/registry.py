@@ -1,12 +1,13 @@
-"""工具工厂注册表：支持按名称为子 Agent 分配权限。"""
+"""工具工厂注册表：支持本地工具与 MCP 工具统一注册。"""
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, List
 
 from config.settings import Settings
 from core.artifact_manager import ArtifactManager
 from core.budget_manager import BudgetManager
+from core.mcp_manager import MCPManager
 from core.task_manager import TaskManager
 from tools.amap_tools import POISearchTool, RoutePlanningTool, WeatherTool
 from tools.base_tool import BaseTool
@@ -20,6 +21,71 @@ from tools.write_report_tool import WriteReportTool
 from skills.registry import SkillRegistry
 
 ToolFactory = Callable[[], BaseTool]
+
+
+def _adapt_mcp_schema_to_function_params(input_schema: Dict[str, Any] | None) -> Dict[str, Any]:
+    """将 MCP inputSchema 适配为 OpenAI/DeepSeek function parameters。"""
+    schema = input_schema or {"type": "object", "properties": {}}
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}}
+    merged = dict(schema)
+    if merged.get("type") != "object":
+        merged["type"] = "object"
+    merged.setdefault("properties", {})
+    return merged
+
+
+class MCPProxyTool(BaseTool):
+    """MCP 工具代理：由前缀工具名路由到 MCPManager。"""
+
+    safety_level = "safe"
+    base_weight = 20
+
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        parameters_schema: Dict[str, Any],
+        mcp_manager: MCPManager,
+    ) -> None:
+        self.name = name
+        self.description = description or "MCP 工具代理"
+        self.parameters_schema = parameters_schema
+        self.mcp_manager = mcp_manager
+
+    def to_openai_tool_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters_schema,
+            },
+        }
+
+    def run(self, **kwargs: Any) -> str:
+        return self.mcp_manager.call_tool(self.name, kwargs)
+
+
+def build_mcp_parent_tools(mcp_manager: MCPManager | None) -> List[BaseTool]:
+    """把 MCP 工具动态转换并并入父 Agent 工具集合。"""
+    if mcp_manager is None:
+        return []
+    tools: List[BaseTool] = []
+    for item in mcp_manager.list_prefixed_tools():
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+        parameters = _adapt_mcp_schema_to_function_params(item.get("inputSchema"))
+        tools.append(
+            MCPProxyTool(
+                name=name,
+                description=str(item.get("description", "")).strip(),
+                parameters_schema=parameters,
+                mcp_manager=mcp_manager,
+            )
+        )
+    return tools
 
 
 def build_tool_factories(

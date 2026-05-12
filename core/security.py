@@ -46,6 +46,8 @@ class PermissionManager:
         "get_weather_forecast",
         "search_poi",
         "plan_route",
+        "write_report_file",
+        "export_ics",
     }
 
     def __init__(self, mode: Mode = Mode.DEFAULT) -> None:

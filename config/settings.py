@@ -26,6 +26,7 @@ class Settings:
     child_model: str
     amap_api_key: str
     tavily_api_key: str
+    mcp_config_path: str
 
 
 def get_settings() -> Settings:
@@ -44,6 +45,7 @@ def get_settings() -> Settings:
     tavily_api_key = os.getenv("TAVILY_API_KEY", "").strip()
     if not tavily_api_key:
         raise ValueError("缺少环境变量 TAVILY_API_KEY，请先在 .env 中配置。")
+    mcp_config_path = os.getenv("MCP_CONFIG_PATH", "workspace/mcp/servers.json").strip()
 
     return Settings(
         deepseek_api_key=api_key,
@@ -53,4 +55,5 @@ def get_settings() -> Settings:
         child_model=child_model,
         amap_api_key=amap_api_key,
         tavily_api_key=tavily_api_key,
+        mcp_config_path=mcp_config_path,
     )

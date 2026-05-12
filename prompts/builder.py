@@ -42,6 +42,12 @@ class SystemPromptBuilder:
                 "涉及住宿筛选、候选对比与排序时，优先调用 `delegate_task`。",
                 "最终结果较长时，优先调用 `write_report_file` 输出完整文件并在回复给摘要。",
                 "在导出行程阶段必须调用 `export_ics`，且时间需使用绝对日期。",
+                "凡方案中出现具体人民币金额（交通、门票、住宿、餐饮、购物等），在给出最终文字总结**之前**，"
+                "必须已调用 `record_expense` 分项记账；金额与项目名称须与方案一致，禁止只写数字不入账。",
+                "凡对用户输出的行程包含两个及以上可地图展示的地点，在全文**最末尾**追加一个 Markdown 围栏代码块："
+                "首行写 ```json（闭合为 ```），块内**仅**包含 JSON 数组，"
+                "每项为 {\"name\": \"地点简称\", \"lng\": 经度小数, \"lat\": 纬度小数}；"
+                "坐标须真实（可来自 `search_poi` / `plan_route` 等工具结果），顺序建议为游玩顺序，便于地图连线。",
             ]
         )
         self.security_text = "\n".join(
@@ -214,11 +220,22 @@ class SystemPromptBuilder:
         sections.append(self._render_section(PromptSection.SKILLS, skills_text))
 
         # 5) 长期记忆
-        memory_text = (
+        memory_profile_text = (
             memory_manager.render_memory_prompt()
             if memory_manager and hasattr(memory_manager, "render_memory_prompt")
             else "长期记忆模块不可用。"
         )
+        memory_guardrails = "\n".join(
+            [
+                "### 记忆库管理守则",
+                "- 在调用 `UpdateMemoryTool` 前，你必须先通读当前的【用户长期档案】。",
+                "- **冲突处理**：如果用户当前诉求与档案记录发生直接矛盾，你必须先判断冲突类型：",
+                "  - 情况 A（长期偏好改变）：用户明确表示以后都变了，调用工具并设置 `conflict_resolution='overwrite_global'`。",
+                "  - 情况 B（特定场景特例）：仅为本次或特定场景，调用工具并设置 `conflict_resolution='add_as_exception'`，并明确填写 `condition`（如 `去成都旅游时`）。",
+                "  - 情况 C（无法确定）：禁止擅自修改记忆，必须直接向用户提问：`我注意到您之前... 这次是否需要为您永久修改档案？`",
+            ]
+        )
+        memory_text = "\n\n".join([memory_profile_text, memory_guardrails])
         sections.append(self._render_section(PromptSection.MEMORY, memory_text))
 
         # 6) 动态状态：时间 + 计划 + 账本 + 强提醒

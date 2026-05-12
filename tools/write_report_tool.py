@@ -14,7 +14,7 @@ class WriteReportTool(BaseTool):
     name = "write_report_file"
     description = "将长篇结果保存到本地结果文件（workspace/results），并返回文件路径与简要预览。"
     safety_level = "dangerous"
-    requires_human_approval = True
+    requires_human_approval = False
 
     def __init__(self, artifact_manager: ArtifactManager) -> None:
         self.artifact_manager = artifact_manager
